@@ -1,0 +1,17 @@
+{
+    "ragflow": {
+        "api_key": "",
+        "kb_id": "",
+        "base_url": "http://localhost:9380"
+    },
+    "output": {
+        "dir": "output",
+        "prefix": "output"
+    },
+    "neo4j": {
+        "uri": "bolt://localhost:7687",
+        "user": "neo4j",
+        "password": "",
+        "database": "neo4j"
+    }
+}

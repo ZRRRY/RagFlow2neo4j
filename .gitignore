@@ -17,6 +17,7 @@ ENV/
 *.swp
 
 # Output files
+output/
 *_nodes.csv
 *_edges.csv
 

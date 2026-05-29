@@ -7,6 +7,8 @@ import os
 import networkx as nx
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import config
 
@@ -25,8 +27,9 @@ KB_ID = config.KB_ID
 RAGFLOW_BASE_URL = config.RAGFLOW_BASE_URL
 OUTPUT_DIR = getattr(config, "OUTPUT_DIR", "")
 OUTPUT_PREFIX = config.OUTPUT_PREFIX
+RAGFLOW_REQUEST_TIMEOUT = getattr(config, "RAGFLOW_REQUEST_TIMEOUT", 120)
 # ----------------------------------------------------
-
+#https://rag.artroot.cn
 
 def _escape_csv_injection(value):
     """对可能触发 Excel/LibreOffice 公式注入的字符串进行转义。
@@ -82,17 +85,34 @@ def sanitize_attrs(G):
     return G
 
 
+def _get_session():
+    """创建带重试机制的 requests Session"""
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    session.mount("http://", HTTPAdapter(max_retries=retries))
+    return session
+
+
 def fetch_knowledge_graph():
     """调用 RAGFlow API 获取知识图谱数据"""
     url = f"{RAGFLOW_BASE_URL}/api/v1/datasets/{KB_ID}/graph/export"
     headers = {
         "Authorization": f"Bearer {RAGFLOW_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "RagFlow2neo4j/1.0 (https://github.com/RagFlow2neo4j)"
     }
 
     logger.info("正在请求: %s", url)
+    logger.info("请求超时设置: %s 秒", RAGFLOW_REQUEST_TIMEOUT)
     try:
-        response = requests.get(url, headers=headers, timeout=30)
+        session = _get_session()
+        response = session.get(url, headers=headers, timeout=RAGFLOW_REQUEST_TIMEOUT)
     except requests.exceptions.RequestException as exc:
         logger.error("请求异常: %s", exc)
         return None

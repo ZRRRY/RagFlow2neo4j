@@ -1,10 +1,15 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul
 title RagFlow2neo4j CLI
+
+:: 强制切换到脚本所在目录，避免从其他路径调用时工作目录错误
+cd /d "%~dp0"
 
 echo ==========================================
 echo   RagFlow2neo4j 启动脚本
 echo ==========================================
+echo [INFO] 当前工作目录: %CD%
+echo [INFO] 脚本路径: %~dp0
 echo.
 
 :: 尝试激活虚拟环境
@@ -52,6 +57,11 @@ echo.
 echo ==========================================
 echo   正在启动 RagFlow2neo4j CLI...
 echo ==========================================
+echo.
+
+:: 诊断：确认加载的是哪个 exporter 模块
+echo [INFO] 诊断 exporter 模块路径：
+python -c "import exporter; print('  ->', exporter.__file__); print('  -> timeout =', exporter.RAGFLOW_REQUEST_TIMEOUT)"
 echo.
 
 :: 启动 CLI

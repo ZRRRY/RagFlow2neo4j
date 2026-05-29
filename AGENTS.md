@@ -37,9 +37,9 @@
 
 ```
 RagFlow2neo4j/
-├── config.json            # 配置文件：RAGFlow、Neo4j、CSV 输出目录及前缀等常量（gitignored）
-├── config.example.json    # 配置示例模板
-├── config.py              # 配置加载器：读取 config.json 并暴露为模块变量
+├── config.py              # 配置文件：Python 格式，支持多 profile 切换（gitignored）
+├── config.example.py      # 配置示例模板
+
 ├── cli.py                 # 交互式 CLI 入口（菜单驱动）
 ├── exporter.py            # RAGFlow API 请求、图转换、CSV 导出
 ├── neo4j_importer.py      # Neo4j 批量写入封装（节点 + 边）
@@ -59,21 +59,22 @@ RagFlow2neo4j/
 
 ### 1. 配置
 
-脚本通过 `config.py` 读取同级目录下的 `config.json`，并暴露为模块变量。各模块仍通过 `import config` 访问以下变量：
+`config.py` 为纯 Python 配置文件，内部定义了 `_PROFILES` 字典（支持 `"local"`、`"remote"` 等任意键名），并通过 `_ACTIVE_PROFILE` 变量指定当前激活的配置集。各模块仍通过 `import config` 访问以下变量：
 
-| 变量名             | 对应 JSON 路径                              | 说明                                      |
-|--------------------|---------------------------------------------|-------------------------------------------|
-| `RAGFLOW_API_KEY`  | `ragflow.api_key`                           | RAGFlow 的 API 访问密钥                   |
-| `KB_ID`            | `ragflow.kb_id`                             | 目标知识库（Dataset）的 ID                |
-| `RAGFLOW_BASE_URL` | `ragflow.base_url`                          | RAGFlow 服务的基础 URL                    |
-| `OUTPUT_DIR`       | `output.dir`                                | CSV 输出文件夹（默认 `"output"`）         |
-| `OUTPUT_PREFIX`    | `output.prefix`                             | 导出 CSV 文件的文件名前缀（默认 `"output"`） |
-| `NEO4J_URI`        | `neo4j.uri`                                 | Neo4j Bolt 连接地址                       |
-| `NEO4J_USER`       | `neo4j.user`                                | Neo4j 用户名                              |
-| `NEO4J_PASSWORD`   | `neo4j.password`                            | Neo4j 密码                                |
-| `NEO4J_DATABASE`   | `neo4j.database`                            | 数据库名称（Neo4j 4.x+ 支持多数据库）     |
+| 变量名             | 说明                                      |
+|--------------------|-------------------------------------------|
+| `RAGFLOW_API_KEY`       | RAGFlow 的 API 访问密钥                   |
+| `KB_ID`                 | 目标知识库（Dataset）的 ID                |
+| `RAGFLOW_BASE_URL`      | RAGFlow 服务的基础 URL                    |
+| `RAGFLOW_REQUEST_TIMEOUT` | 请求 RAGFlow API 的超时时间（秒），默认 120 |
+| `OUTPUT_DIR`       | CSV 输出文件夹（默认 `"output"`）         |
+| `OUTPUT_PREFIX`    | 导出 CSV 文件的文件名前缀（默认 `"output"`） |
+| `NEO4J_URI`        | Neo4j Bolt 连接地址                       |
+| `NEO4J_USER`       | Neo4j 用户名                              |
+| `NEO4J_PASSWORD`   | Neo4j 密码                                |
+| `NEO4J_DATABASE`   | 数据库名称（Neo4j 4.x+ 支持多数据库）     |
 
-首次使用时，复制 `config.example.json` 为 `config.json` 并填写实际值。`config.py` 在导入时会执行非空校验：若 `ragflow.api_key`、`ragflow.kb_id`、`neo4j.password` 为空，会直接抛出 `ValueError`。
+首次使用时，复制 `config.example.py` 为 `config.py` 并填写实际值。修改 `_ACTIVE_PROFILE` 的值即可切换配置集（例如 `"local"` ↔ `"remote"`）。`config.py` 在导入时会执行非空校验：若当前 profile 的 `ragflow.api_key`、`ragflow.kb_id`、`neo4j.password` 为空，会直接抛出 `ValueError`。
 
 ### 2. 运行
 
@@ -169,8 +170,8 @@ pytest tests/
 
 ## 安全注意事项
 
-- **API 密钥与密码硬编码风险**：敏感信息集中在 `config.json` 中，该文件已被 `.gitignore` 排除，不会被意外提交。示例配置请使用 `config.example.json`（不含真实密钥）。
-  - **建议**：生产环境优先通过环境变量读取，或确保 `config.json` 仅在本地保留。
+- **API 密钥与密码硬编码风险**：敏感信息集中在 `config.py` 中，该文件已被 `.gitignore` 排除，不会被意外提交。示例配置请使用 `config.example.py`（不含真实密钥）。
+  - **建议**：生产环境优先通过环境变量读取，或确保 `config.py` 仅在本地保留。
 - **CSV 注入**：已在 `exporter.py` 的 `_escape_csv_injection` 中对危险前缀字符进行单引号转义，但仍需注意知识图谱中是否包含其他 Office 公式触发字符。
 - **数据库清空不可逆**：`Neo4jWriter.clear_database()` 执行 `MATCH (n) DETACH DELETE n`，CLI 在执行前会要求用户输入 `y` 确认，但仍需谨慎操作。
 - **无输入校验**：`KB_ID`、`RAGFLOW_BASE_URL`、`NEO4J_URI` 等配置未做格式校验，传入异常值可能导致请求失败或连接错误。

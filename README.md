@@ -142,6 +142,12 @@ RagFlow2neo4j/
 
 ---
 
+## 数据格式说明
+
+RAGFlow `/api/v1/datasets/{KB_ID}/graph/export` 接口返回的 JSON 结构详细说明，请参阅 [docs/ragflow_api_data_format.md](docs/ragflow_api_data_format.md)。
+
+---
+
 ## 运行测试
 
 ```bash

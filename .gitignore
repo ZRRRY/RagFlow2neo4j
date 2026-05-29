@@ -22,6 +22,6 @@ output/
 *_edges.csv
 
 # Secrets / local config
-config.json
+config.py
 config_local.py
 .env

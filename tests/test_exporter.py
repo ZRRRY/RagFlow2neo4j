@@ -75,28 +75,38 @@ class TestSanitizeAttrs:
 
 
 class TestFetchKnowledgeGraph:
-    @mock.patch("exporter.requests.get")
-    def test_success(self, mock_get):
-        mock_get.return_value = mock.Mock(
+    def _mock_session(self, status_code=200, text="", json=None, side_effect=None):
+        mock_resp = mock.Mock()
+        mock_resp.status_code = status_code
+        mock_resp.text = text
+        if json is not None:
+            mock_resp.json = json
+        mock_session = mock.Mock()
+        mock_session.get = mock.Mock(return_value=mock_resp, side_effect=side_effect)
+        return mock_session
+
+    @mock.patch("exporter._get_session")
+    def test_success(self, mock_get_session):
+        mock_get_session.return_value = self._mock_session(
             status_code=200,
             text='{"code":0,"data":{"graph":{"nodes":[],"edges":[]}}}',
             json=lambda: {"code": 0, "data": {"graph": {"nodes": [], "edges": []}}},
         )
         result = exporter.fetch_knowledge_graph()
         assert result == {"graph": {"nodes": [], "edges": []}}
-        mock_get.assert_called_once()
+        mock_get_session.return_value.get.assert_called_once()
 
-    @mock.patch("exporter.requests.get")
-    def test_http_error(self, mock_get):
-        mock_get.return_value = mock.Mock(
+    @mock.patch("exporter._get_session")
+    def test_http_error(self, mock_get_session):
+        mock_get_session.return_value = self._mock_session(
             status_code=500, text="Internal Server Error"
         )
         result = exporter.fetch_knowledge_graph()
         assert result is None
 
-    @mock.patch("exporter.requests.get")
-    def test_api_error_code(self, mock_get):
-        mock_get.return_value = mock.Mock(
+    @mock.patch("exporter._get_session")
+    def test_api_error_code(self, mock_get_session):
+        mock_get_session.return_value = self._mock_session(
             status_code=200,
             text='{"code":-1,"message":"auth failed"}',
             json=lambda: {"code": -1, "message": "auth failed"},
@@ -104,9 +114,9 @@ class TestFetchKnowledgeGraph:
         result = exporter.fetch_knowledge_graph()
         assert result is None
 
-    @mock.patch("exporter.requests.get")
-    def test_json_decode_error(self, mock_get):
-        mock_get.return_value = mock.Mock(
+    @mock.patch("exporter._get_session")
+    def test_json_decode_error(self, mock_get_session):
+        mock_get_session.return_value = self._mock_session(
             status_code=200,
             text="not json",
             json=lambda: json.loads("not json"),
@@ -114,9 +124,11 @@ class TestFetchKnowledgeGraph:
         result = exporter.fetch_knowledge_graph()
         assert result is None
 
-    @mock.patch("exporter.requests.get")
-    def test_request_exception(self, mock_get):
-        mock_get.side_effect = requests.exceptions.ConnectionError("Connection refused")
+    @mock.patch("exporter._get_session")
+    def test_request_exception(self, mock_get_session):
+        mock_get_session.return_value = self._mock_session(
+            side_effect=requests.exceptions.ConnectionError("Connection refused")
+        )
         result = exporter.fetch_knowledge_graph()
         assert result is None
 

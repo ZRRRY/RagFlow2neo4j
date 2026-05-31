@@ -20,6 +20,17 @@ _NEO4J = {
     "database": "neo4j",
 }
 
+# OpenSearch 直连配置（可选）
+# 当 RAGFlow 的 /graph/export 因数据量过大触发 Internal server error 时，
+# 可启用此配置绕过 API，直接从底层 OpenSearch 读取完整的知识图谱数据。
+_OPENSEARCH = {
+    "host": "localhost",
+    "port": 9201,
+    "user": "admin",
+    "password": "",
+    "use_ssl": False,
+}
+
 _PROFILES = {
     "local": {
         "ragflow": {
@@ -30,6 +41,7 @@ _PROFILES = {
         },
         "output": _OUTPUT,
         "neo4j": _NEO4J,
+        "opensearch": _OPENSEARCH,
     },
     "remote": {
         "ragflow": {
@@ -40,6 +52,7 @@ _PROFILES = {
         },
         "output": _OUTPUT,
         "neo4j": _NEO4J,
+        "opensearch": _OPENSEARCH,
     },
 }
 
@@ -76,6 +89,15 @@ NEO4J_USER = _neo4j_cfg["user"]
 NEO4J_PASSWORD = _neo4j_cfg["password"]
 NEO4J_DATABASE = _neo4j_cfg["database"]
 # -----------------------------------------------
+
+# ----------------- OpenSearch 直连配置（可选）------------------
+_opensearch_cfg = _cfg.get("opensearch", {})
+OPENSEARCH_HOST = _opensearch_cfg.get("host", "localhost")
+OPENSEARCH_PORT = _opensearch_cfg.get("port", 9201)
+OPENSEARCH_USER = _opensearch_cfg.get("user", "admin")
+OPENSEARCH_PASSWORD = _opensearch_cfg.get("password", "")
+OPENSEARCH_USE_SSL = _opensearch_cfg.get("use_ssl", False)
+# -----------------------------------------------------------
 
 # 简单校验
 if not RAGFLOW_API_KEY:

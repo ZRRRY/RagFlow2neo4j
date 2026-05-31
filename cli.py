@@ -4,7 +4,7 @@ import os
 import sys
 
 import config
-from exporter import fetch_knowledge_graph, export_graph
+from exporter import fetch_knowledge_graph, fetch_knowledge_graph_direct, export_graph
 from neo4j_importer import Neo4jWriter
 
 logging.basicConfig(
@@ -32,17 +32,18 @@ def menu():
     print("=" * 40)
     print("当前知识库 ID:", config.KB_ID)
     print("-" * 40)
-    print("1. 仅从 RagFlow 导出 CSV")
-    print("2. 仅从 CSV 导入 Neo4j")
-    print("3. 自动执行导出 + 导入 Neo4j（保留 CSV）")
-    print("4. 退出")
+    print("1. 从 RagFlow API 导出 CSV")
+    print("2. 从 OpenSearch 直连导出 CSV")
+    print("3. 仅从 CSV 导入 Neo4j")
+    print("4. 自动执行导出 + 导入 Neo4j")
+    print("5. 退出")
     print("-" * 40)
-    choice = input("请输入选项 [1-4]: ").strip()
+    choice = input("请输入选项 [1-5]: ").strip()
     return choice
 
 
-def action_export_only():
-    logger.info("开始从 RagFlow 导出 CSV...")
+def action_export_api():
+    logger.info("开始从 RagFlow API 导出 CSV...")
     data = fetch_knowledge_graph()
     if data:
         export_graph(data)
@@ -79,11 +80,23 @@ def action_import_only():
     logger.info("Neo4j 导入完成！")
 
 
-def action_auto():
-    logger.info("步骤 1/2: 从 RagFlow 导出 CSV...")
-    data = fetch_knowledge_graph()
+def action_export_direct():
+    logger.info("开始从 OpenSearch 直连导出 CSV...")
+    data = fetch_knowledge_graph_direct()
+    if data:
+        export_graph(data)
+        nodes, edges = _default_csv_paths()
+        logger.info("CSV 导出完成: %s, %s", nodes, edges)
+    else:
+        logger.error("从 OpenSearch 获取数据失败，导出终止。")
+
+
+def _run_export_import(data_fetcher, export_label):
+    """统一的导出+导入执行逻辑"""
+    logger.info("步骤 1/2: %s...", export_label)
+    data = data_fetcher()
     if not data:
-        logger.error("从 RagFlow 获取数据失败。")
+        logger.error("导出失败，自动流程终止。")
         return
 
     export_graph(data)
@@ -106,17 +119,35 @@ def action_auto():
     logger.info("自动流程执行完毕！")
 
 
+def action_auto():
+    print("-" * 40)
+    print("请选择导出方式：")
+    print("a. 使用 RagFlow API 导出")
+    print("b. 使用 OpenSearch 直连导出")
+    print("-" * 40)
+    sub = input("请输入选项 [a/b]: ").strip().lower()
+
+    if sub == "a":
+        _run_export_import(fetch_knowledge_graph, "从 RagFlow API 导出 CSV")
+    elif sub == "b":
+        _run_export_import(fetch_knowledge_graph_direct, "从 OpenSearch 直连导出 CSV")
+    else:
+        print("无效选项，返回主菜单。")
+
+
 def main():
     while True:
         try:
             choice = menu()
             if choice == "1":
-                action_export_only()
+                action_export_api()
             elif choice == "2":
-                action_import_only()
+                action_export_direct()
             elif choice == "3":
-                action_auto()
+                action_import_only()
             elif choice == "4":
+                action_auto()
+            elif choice == "5":
                 print("再见！")
                 sys.exit(0)
             else:

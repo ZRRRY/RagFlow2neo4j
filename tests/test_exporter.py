@@ -13,6 +13,11 @@ mock_config.NEO4J_URI = "bolt://localhost:7687"
 mock_config.NEO4J_USER = "neo4j"
 mock_config.NEO4J_PASSWORD = "test"
 mock_config.NEO4J_DATABASE = "neo4j"
+mock_config.OPENSEARCH_HOST = "localhost"
+mock_config.OPENSEARCH_PORT = 9201
+mock_config.OPENSEARCH_USER = "admin"
+mock_config.OPENSEARCH_PASSWORD = "test"
+mock_config.OPENSEARCH_USE_SSL = False
 sys.modules["config"] = mock_config
 
 import json
@@ -130,6 +135,111 @@ class TestFetchKnowledgeGraph:
             side_effect=requests.exceptions.ConnectionError("Connection refused")
         )
         result = exporter.fetch_knowledge_graph()
+        assert result is None
+
+
+class TestFetchKnowledgeGraphDirect:
+    def _mock_dataset_resp(self, tenant_id="test-tenant", code=0, message="", status_code=200, side_effect=None):
+        """构造 RAGFlow Dataset API 的 mock 响应"""
+        mock_resp = mock.Mock()
+        mock_resp.status_code = status_code
+        mock_resp.text = ""
+        if side_effect:
+            mock_resp.json = mock.Mock(side_effect=side_effect)
+        else:
+            mock_resp.json = mock.Mock(return_value={
+                "code": code,
+                "message": message,
+                "data": {"tenant_id": tenant_id} if tenant_id else {}
+            })
+        mock_session = mock.Mock()
+        mock_session.get = mock.Mock(return_value=mock_resp, side_effect=side_effect)
+        return mock_session
+
+    def _mock_os_resp(self, status_code=200, json_data=None, side_effect=None):
+        """构造 OpenSearch _search API 的 mock 响应"""
+        mock_resp = mock.Mock()
+        mock_resp.status_code = status_code
+        mock_resp.text = ""
+        if side_effect:
+            mock_resp.json = mock.Mock(side_effect=side_effect)
+        else:
+            mock_resp.json = mock.Mock(return_value=json_data)
+        return mock_resp
+
+    @mock.patch("exporter.requests.post")
+    @mock.patch("exporter._get_session")
+    def test_success(self, mock_get_session, mock_os_post):
+        mock_get_session.return_value = self._mock_dataset_resp(tenant_id="t-123")
+        graph_json = {
+            "directed": False,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [{"id": "n1"}],
+            "edges": [{"source": "n1", "target": "n2"}],
+        }
+        mock_os_post.return_value = self._mock_os_resp(
+            json_data={
+                "hits": {
+                    "hits": [
+                        {"_source": {"content_with_weight": json.dumps(graph_json)}}
+                    ]
+                }
+            }
+        )
+        result = exporter.fetch_knowledge_graph_direct()
+        assert result == {"graph": graph_json}
+        mock_get_session.return_value.get.assert_called_once()
+        mock_os_post.assert_called_once()
+
+    @mock.patch("exporter.requests.post")
+    @mock.patch("exporter._get_session")
+    def test_dataset_http_error(self, mock_get_session, mock_os_post):
+        mock_get_session.return_value = self._mock_dataset_resp(status_code=500)
+        result = exporter.fetch_knowledge_graph_direct()
+        assert result is None
+        mock_os_post.assert_not_called()
+
+    @mock.patch("exporter.requests.post")
+    @mock.patch("exporter._get_session")
+    def test_dataset_api_error_code(self, mock_get_session, mock_os_post):
+        mock_get_session.return_value = self._mock_dataset_resp(code=102, message="error")
+        result = exporter.fetch_knowledge_graph_direct()
+        assert result is None
+        mock_os_post.assert_not_called()
+
+    @mock.patch("exporter.requests.post")
+    @mock.patch("exporter._get_session")
+    def test_opensearch_http_error(self, mock_get_session, mock_os_post):
+        mock_get_session.return_value = self._mock_dataset_resp(tenant_id="t-123")
+        mock_os_post.return_value = self._mock_os_resp(status_code=500)
+        result = exporter.fetch_knowledge_graph_direct()
+        assert result is None
+
+    @mock.patch("exporter.requests.post")
+    @mock.patch("exporter._get_session")
+    def test_opensearch_empty_hits(self, mock_get_session, mock_os_post):
+        mock_get_session.return_value = self._mock_dataset_resp(tenant_id="t-123")
+        mock_os_post.return_value = self._mock_os_resp(
+            json_data={"hits": {"hits": []}}
+        )
+        result = exporter.fetch_knowledge_graph_direct()
+        assert result is None
+
+    @mock.patch("exporter.requests.post")
+    @mock.patch("exporter._get_session")
+    def test_parse_content_with_weight_fail(self, mock_get_session, mock_os_post):
+        mock_get_session.return_value = self._mock_dataset_resp(tenant_id="t-123")
+        mock_os_post.return_value = self._mock_os_resp(
+            json_data={
+                "hits": {
+                    "hits": [
+                        {"_source": {"content_with_weight": "not valid json"}}
+                    ]
+                }
+            }
+        )
+        result = exporter.fetch_knowledge_graph_direct()
         assert result is None
 
 

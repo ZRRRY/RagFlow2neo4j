@@ -134,6 +134,206 @@ def fetch_knowledge_graph():
     return result.get("data")
 
 
+def fetch_knowledge_graph_direct():
+    """绕过 RAGFlow /graph/export API，直接从 OpenSearch 读取完整的知识图谱数据。
+
+    适用场景：RAGFlow 因 OpenSearch max_result_window 限制导致导出接口返回
+    Internal server error（HTTP 200, code=102）时。
+
+    实现原理：RAGFlow 在构建完知识图谱后，会将完整的 NetworkX node_link_data
+    序列化后存入 OpenSearch 中 knowledge_graph_kwd="graph" 的文档。该文档只有
+    一条，不受分页窗口限制，因此可直接读取以绕过 RAGFlow 侧有缺陷的分页查询逻辑。
+
+    返回格式与 fetch_knowledge_graph() 保持一致：{"graph": <dict>}。
+    """
+    # ---- 1. 通过 RAGFlow Dataset API 获取 tenant_id ----
+    dataset_url = f"{RAGFLOW_BASE_URL}/api/v1/datasets/{KB_ID}"
+    headers = {
+        "Authorization": f"Bearer {RAGFLOW_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "RagFlow2neo4j/1.0 (https://github.com/RagFlow2neo4j)",
+    }
+
+    logger.info("正在获取 Dataset 信息以确定 tenant_id: %s", dataset_url)
+    try:
+        session = _get_session()
+        resp = session.get(dataset_url, headers=headers, timeout=30)
+    except requests.exceptions.RequestException as exc:
+        logger.error("获取 Dataset 信息请求异常: %s", exc)
+        return None
+
+    if resp.status_code != 200:
+        logger.error("获取 Dataset 信息失败: HTTP %s, %s", resp.status_code, resp.text)
+        return None
+
+    try:
+        dataset_result = resp.json()
+    except json.JSONDecodeError as exc:
+        logger.error("Dataset 响应 JSON 解析失败: %s", exc)
+        return None
+
+    if dataset_result.get("code") != 0:
+        logger.error("Dataset API 返回错误: %s", dataset_result.get("message"))
+        return None
+
+    tenant_id = dataset_result.get("data", {}).get("tenant_id")
+    if not tenant_id:
+        logger.error("Dataset 响应中缺少 tenant_id，无法确定 OpenSearch 索引名。")
+        return None
+
+    # ---- 2. 直连 OpenSearch 查询 graph 文档 ----
+    os_host = getattr(config, "OPENSEARCH_HOST", "localhost")
+    os_port = getattr(config, "OPENSEARCH_PORT", 9201)
+    os_user = getattr(config, "OPENSEARCH_USER", "admin")
+    os_pass = getattr(config, "OPENSEARCH_PASSWORD", "")
+    os_ssl = getattr(config, "OPENSEARCH_USE_SSL", False)
+    scheme = "https" if os_ssl else "http"
+
+    index_name = f"ragflow_{tenant_id}"
+    search_url = f"{scheme}://{os_host}:{os_port}/{index_name}/_search"
+
+    query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"term": {"kb_id": KB_ID}},
+                    {"term": {"knowledge_graph_kwd": "graph"}},
+                ]
+            }
+        },
+        "size": 1,
+    }
+
+    auth = (os_user, os_pass) if os_user else None
+    logger.info("正在直连 OpenSearch 读取 graph 文档: %s", search_url)
+
+    try:
+        os_resp = requests.post(search_url, json=query, auth=auth, timeout=60)
+    except requests.exceptions.RequestException as exc:
+        logger.error("OpenSearch 请求异常: %s", exc)
+        return None
+
+    if os_resp.status_code != 200:
+        logger.error("OpenSearch 查询失败: HTTP %s, %s", os_resp.status_code, os_resp.text)
+        return None
+
+    try:
+        os_result = os_resp.json()
+    except json.JSONDecodeError as exc:
+        logger.error("OpenSearch 响应 JSON 解析失败: %s", exc)
+        return None
+
+    hits = os_result.get("hits", {}).get("hits", [])
+    if not hits:
+        logger.warning(
+            "OpenSearch 中未找到 knowledge_graph_kwd='graph' 的汇总文档，"
+            "正在执行诊断查询并尝试从 subgraph 重建..."
+        )
+        # ---- 诊断：查看该 kb_id 下有哪些类型的数据 ----
+        diag_query = {
+            "query": {"bool": {"filter": [{"term": {"kb_id": KB_ID}}]}},
+            "size": 0,
+            "aggs": {"kg_types": {"terms": {"field": "knowledge_graph_kwd", "size": 10}}},
+        }
+        has_subgraph = False
+        try:
+            diag_resp = requests.post(search_url, json=diag_query, auth=auth, timeout=30)
+            if diag_resp.status_code == 200:
+                diag_result = diag_resp.json()
+                buckets = diag_result.get("aggregations", {}).get("kg_types", {}).get("buckets", [])
+                if buckets:
+                    logger.info("诊断结果：该知识库在 OpenSearch 中的数据分布如下：")
+                    for b in buckets:
+                        logger.info("  - %s: %s 条", b["key"], b["doc_count"])
+                        if b["key"] == "subgraph":
+                            has_subgraph = True
+                else:
+                    logger.error("诊断结果：该 kb_id 在 OpenSearch 中无任何文档。")
+                    return None
+            else:
+                logger.error("诊断查询失败: HTTP %s, %s", diag_resp.status_code, diag_resp.text)
+                return None
+        except Exception as exc:
+            logger.error("诊断查询异常: %s", exc)
+            return None
+
+        # ---- Fallback：从 subgraph 文档重建完整图 ----
+        if not has_subgraph:
+            logger.error("该知识库既没有 graph 文档，也没有 subgraph 文档，无法重建。")
+            return None
+
+        subgraph_query = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"kb_id": KB_ID}},
+                        {"term": {"knowledge_graph_kwd": "subgraph"}},
+                    ]
+                }
+            },
+            "size": 1000,
+        }
+        logger.info("正在从 subgraph 文档重建完整知识图谱...")
+        try:
+            sg_resp = requests.post(search_url, json=subgraph_query, auth=auth, timeout=60)
+            sg_resp.raise_for_status()
+            sg_result = sg_resp.json()
+        except Exception as exc:
+            logger.error("查询 subgraph 文档失败: %s", exc)
+            return None
+
+        sg_hits = sg_result.get("hits", {}).get("hits", [])
+        if not sg_hits:
+            logger.error("subgraph 查询返回空结果，无法重建。")
+            return None
+
+        merged = nx.Graph()
+        for idx, hit in enumerate(sg_hits, 1):
+            try:
+                sg_data = json.loads(hit["_source"]["content_with_weight"])
+                source_ids = hit["_source"].get("source_id", [])
+                sg_graph = nx.node_link_graph(sg_data, edges="edges")
+                logger.info(
+                    "  Subgraph %s/%s: source_id=%s, nodes=%s, edges=%s",
+                    idx, len(sg_hits), source_ids,
+                    sg_graph.number_of_nodes(), sg_graph.number_of_edges(),
+                )
+                merged = nx.compose(merged, sg_graph)
+            except Exception as exc:
+                logger.warning("  Subgraph %s/%s 解析失败，已跳过: %s", idx, len(sg_hits), exc)
+                continue
+
+        if merged.number_of_nodes() == 0:
+            logger.error("所有 subgraph 文档解析后节点数为 0，重建失败。")
+            return None
+
+        graph_data = nx.node_link_data(merged, edges="edges")
+        node_count = len(graph_data.get("nodes", []))
+        edge_count = len(graph_data.get("edges", []))
+        logger.info(
+            "成功从 %s 条 subgraph 重建完整知识图谱: %s 个节点, %s 条边",
+            len(sg_hits), node_count, edge_count,
+        )
+        return {"graph": graph_data}
+
+    # ---- 3. 解析 content_with_weight 中的图数据 ----
+    try:
+        source = hits[0]["_source"]
+        graph_data = json.loads(source["content_with_weight"])
+    except Exception as exc:
+        logger.error("解析 graph 文档 content_with_weight 失败: %s", exc)
+        return None
+
+    node_count = len(graph_data.get("nodes", []))
+    edge_count = len(graph_data.get("edges", []))
+    logger.info(
+        "成功从 OpenSearch 获取完整知识图谱: %s 个节点, %s 条边",
+        node_count, edge_count,
+    )
+
+    return {"graph": graph_data}
+
+
 def export_graph(data):
     """将 API 数据转为图对象并导出 CSV 文件（节点和边）"""
     if not isinstance(data, dict):

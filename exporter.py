@@ -29,7 +29,8 @@ OUTPUT_DIR = getattr(config, "OUTPUT_DIR", "")
 OUTPUT_PREFIX = config.OUTPUT_PREFIX
 RAGFLOW_REQUEST_TIMEOUT = getattr(config, "RAGFLOW_REQUEST_TIMEOUT", 120)
 # ----------------------------------------------------
-#https://rag.artroot.cn
+# https://rag.artroot.cn
+
 
 def _escape_csv_injection(value):
     """对可能触发 Excel/LibreOffice 公式注入的字符串进行转义。
@@ -43,44 +44,37 @@ def _escape_csv_injection(value):
     return value
 
 
+def _safe_serialize(value):
+    """将任何复杂值转换为 CSV 安全字符串。"""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return ""
+    if isinstance(value, (str, int, bool, float)):
+        return value
+    if isinstance(value, (list, dict, tuple, set)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 def sanitize_attrs(G):
     """递归处理图中所有节点和边的属性，将非标量值转换为 JSON 字符串，
     并处理 None 和 NaN，确保 CSV 导出时的兼容性。
     """
-    def safe_serialize(value):
-        """将任何复杂值转换为字符串"""
-        # 处理 None
-        if value is None:
-            return ""
-        # 处理 NaN 或 Infinity (float类型)
-        if isinstance(value, float):
-            if math.isnan(value) or math.isinf(value):
-                return ""
-        # 基础类型直接返回（float 中 NaN/Infinity 已在上一步处理）
-        if isinstance(value, (str, int, bool, float)):
-            return value
-        # 列表、字典等复杂类型 -> JSON 字符串
-        if isinstance(value, (list, dict, tuple, set)):
-            try:
-                return json.dumps(value, ensure_ascii=False)
-            except (TypeError, ValueError):
-                return str(value)
-        # 其他类型转字符串
-        return str(value)
-
-    # 清洗所有节点属性
     for node, attrs in list(G.nodes(data=True)):
         for key, value in list(attrs.items()):
-            attrs[key] = _escape_csv_injection(safe_serialize(value))
+            attrs[key] = _escape_csv_injection(_safe_serialize(value))
 
-    # 清洗所有边属性
     for u, v, attrs in list(G.edges(data=True)):
         for key, value in list(attrs.items()):
-            attrs[key] = _escape_csv_injection(safe_serialize(value))
+            attrs[key] = _escape_csv_injection(_safe_serialize(value))
 
-    # 同样处理图级别的属性（如果有）
     for key, value in list(G.graph.items()):
-        G.graph[key] = _escape_csv_injection(safe_serialize(value))
+        G.graph[key] = _escape_csv_injection(_safe_serialize(value))
 
     return G
 
@@ -97,6 +91,45 @@ def _get_session():
     session.mount("https://", HTTPAdapter(max_retries=retries))
     session.mount("http://", HTTPAdapter(max_retries=retries))
     return session
+
+
+def _get_tenant_id():
+    """通过 RAGFlow Dataset API 获取 tenant_id。"""
+    dataset_url = f"{RAGFLOW_BASE_URL}/api/v1/datasets/{KB_ID}"
+    headers = {
+        "Authorization": f"Bearer {RAGFLOW_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "RagFlow2neo4j/1.0 (https://github.com/RagFlow2neo4j)",
+    }
+
+    logger.info("正在获取 Dataset 信息以确定 tenant_id: %s", dataset_url)
+    try:
+        session = _get_session()
+        resp = session.get(dataset_url, headers=headers, timeout=30)
+    except requests.exceptions.RequestException as exc:
+        logger.error("获取 Dataset 信息请求异常: %s", exc)
+        return None
+
+    if resp.status_code != 200:
+        logger.error("获取 Dataset 信息失败: HTTP %s, %s", resp.status_code, resp.text)
+        return None
+
+    try:
+        dataset_result = resp.json()
+    except json.JSONDecodeError as exc:
+        logger.error("Dataset 响应 JSON 解析失败: %s", exc)
+        return None
+
+    if dataset_result.get("code") != 0:
+        logger.error("Dataset API 返回错误: %s", dataset_result.get("message"))
+        return None
+
+    tenant_id = dataset_result.get("data", {}).get("tenant_id")
+    if not tenant_id:
+        logger.error("Dataset 响应中缺少 tenant_id，无法确定 OpenSearch 索引名。")
+        return None
+
+    return tenant_id
 
 
 def fetch_knowledge_graph():
@@ -134,54 +167,79 @@ def fetch_knowledge_graph():
     return result.get("data")
 
 
+def _count_os_docs(count_url, query, auth):
+    """使用 OpenSearch _count API 获取符合条件的文档总数。"""
+    try:
+        resp = requests.post(count_url, json=query, auth=auth, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        return result.get("count", 0)
+    except Exception as exc:
+        logger.error("OpenSearch 计数请求异常: %s", exc)
+        return None
+
+
+def _scroll_search_batches(search_url, query, auth, scheme, os_host, os_port, batch_size=1000):
+    """使用 OpenSearch scroll API 逐批次 yield hits 列表。"""
+    scroll_id = None
+    scroll_search_url = f"{search_url}?scroll=2m"
+
+    try:
+        init_resp = requests.post(
+            scroll_search_url,
+            json={**query, "size": batch_size},
+            auth=auth,
+            timeout=60,
+        )
+        init_resp.raise_for_status()
+        init_result = init_resp.json()
+        scroll_id = init_result.get("_scroll_id")
+        hits = init_result.get("hits", {}).get("hits", [])
+        if hits:
+            yield hits
+
+        while len(hits) > 0:
+            scroll_resp = requests.post(
+                f"{scheme}://{os_host}:{os_port}/_search/scroll",
+                json={"scroll": "2m", "scroll_id": scroll_id},
+                auth=auth,
+                timeout=60,
+            )
+            scroll_resp.raise_for_status()
+            scroll_result = scroll_resp.json()
+            scroll_id = scroll_result.get("_scroll_id")
+            hits = scroll_result.get("hits", {}).get("hits", [])
+            if hits:
+                yield hits
+    finally:
+        if scroll_id:
+            try:
+                requests.delete(
+                    f"{scheme}://{os_host}:{os_port}/_search/scroll",
+                    json={"scroll_id": [scroll_id]},
+                    auth=auth,
+                    timeout=30,
+                )
+            except Exception:
+                pass
+
+
 def fetch_knowledge_graph_direct():
-    """绕过 RAGFlow /graph/export API，直接从 OpenSearch 读取完整的知识图谱数据。
+    """绕过 RAGFlow /graph/export API，直接从 OpenSearch 读取实体和关系文档构建知识图谱。
 
-    适用场景：RAGFlow 因 OpenSearch max_result_window 限制导致导出接口返回
-    Internal server error（HTTP 200, code=102）时。
+    适用场景：RAGFlow 因数据量过大导致导出接口异常时。
 
-    实现原理：RAGFlow 在构建完知识图谱后，会将完整的 NetworkX node_link_data
-    序列化后存入 OpenSearch 中 knowledge_graph_kwd="graph" 的文档。该文档只有
-    一条，不受分页窗口限制，因此可直接读取以绕过 RAGFlow 侧有缺陷的分页查询逻辑。
+    实现原理：RAGFlow 将最终知识图谱以独立文档形式存入 OpenSearch：
+      - 实体文档：knowledge_graph_kwd="entity"
+      - 关系文档：knowledge_graph_kwd="relation"
+    本方法分别读取这两类文档，解析后构建 NetworkX 图对象。
 
     返回格式与 fetch_knowledge_graph() 保持一致：{"graph": <dict>}。
     """
-    # ---- 1. 通过 RAGFlow Dataset API 获取 tenant_id ----
-    dataset_url = f"{RAGFLOW_BASE_URL}/api/v1/datasets/{KB_ID}"
-    headers = {
-        "Authorization": f"Bearer {RAGFLOW_API_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": "RagFlow2neo4j/1.0 (https://github.com/RagFlow2neo4j)",
-    }
-
-    logger.info("正在获取 Dataset 信息以确定 tenant_id: %s", dataset_url)
-    try:
-        session = _get_session()
-        resp = session.get(dataset_url, headers=headers, timeout=30)
-    except requests.exceptions.RequestException as exc:
-        logger.error("获取 Dataset 信息请求异常: %s", exc)
-        return None
-
-    if resp.status_code != 200:
-        logger.error("获取 Dataset 信息失败: HTTP %s, %s", resp.status_code, resp.text)
-        return None
-
-    try:
-        dataset_result = resp.json()
-    except json.JSONDecodeError as exc:
-        logger.error("Dataset 响应 JSON 解析失败: %s", exc)
-        return None
-
-    if dataset_result.get("code") != 0:
-        logger.error("Dataset API 返回错误: %s", dataset_result.get("message"))
-        return None
-
-    tenant_id = dataset_result.get("data", {}).get("tenant_id")
+    tenant_id = _get_tenant_id()
     if not tenant_id:
-        logger.error("Dataset 响应中缺少 tenant_id，无法确定 OpenSearch 索引名。")
         return None
 
-    # ---- 2. 直连 OpenSearch 查询 graph 文档 ----
     os_host = getattr(config, "OPENSEARCH_HOST", "localhost")
     os_port = getattr(config, "OPENSEARCH_PORT", 9201)
     os_user = getattr(config, "OPENSEARCH_USER", "admin")
@@ -191,147 +249,336 @@ def fetch_knowledge_graph_direct():
 
     index_name = f"ragflow_{tenant_id}"
     search_url = f"{scheme}://{os_host}:{os_port}/{index_name}/_search"
+    auth = (os_user, os_pass) if os_user else None
 
-    query = {
+    entity_query = {
         "query": {
             "bool": {
                 "filter": [
                     {"term": {"kb_id": KB_ID}},
-                    {"term": {"knowledge_graph_kwd": "graph"}},
+                    {"term": {"knowledge_graph_kwd": "entity"}},
                 ]
             }
-        },
-        "size": 1,
+        }
+    }
+    relation_query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"term": {"kb_id": KB_ID}},
+                    {"term": {"knowledge_graph_kwd": "relation"}},
+                ]
+            }
+        }
     }
 
-    auth = (os_user, os_pass) if os_user else None
-    logger.info("正在直连 OpenSearch 读取 graph 文档: %s", search_url)
+    logger.info("正在从 OpenSearch 读取实体文档...")
+    entity_hits = list(_scroll_search_batches(search_url, entity_query, auth, scheme, os_host, os_port))
+    entity_hits = [hit for batch in entity_hits for hit in batch]
+    logger.info("共读取 %s 个实体文档", len(entity_hits))
 
-    try:
-        os_resp = requests.post(search_url, json=query, auth=auth, timeout=60)
-    except requests.exceptions.RequestException as exc:
-        logger.error("OpenSearch 请求异常: %s", exc)
+    logger.info("正在从 OpenSearch 读取关系文档...")
+    relation_hits = list(_scroll_search_batches(search_url, relation_query, auth, scheme, os_host, os_port))
+    relation_hits = [hit for batch in relation_hits for hit in batch]
+    logger.info("共读取 %s 个关系文档", len(relation_hits))
+
+    if not entity_hits and not relation_hits:
+        logger.error("该知识库在 OpenSearch 中没有任何实体或关系文档，无法构建图谱。")
         return None
 
-    if os_resp.status_code != 200:
-        logger.error("OpenSearch 查询失败: HTTP %s, %s", os_resp.status_code, os_resp.text)
-        return None
+    G = nx.Graph()
+    G.graph["created_by"] = "RagFlow2neo4j_direct"
 
-    try:
-        os_result = os_resp.json()
-    except json.JSONDecodeError as exc:
-        logger.error("OpenSearch 响应 JSON 解析失败: %s", exc)
-        return None
+    node_count = 0
+    for hit in entity_hits:
+        source = hit.get("_source", {})
+        entity_name = source.get("entity_kwd")
+        if not entity_name:
+            continue
 
-    hits = os_result.get("hits", {}).get("hits", [])
-    if not hits:
-        logger.warning(
-            "OpenSearch 中未找到 knowledge_graph_kwd='graph' 的汇总文档，"
-            "正在执行诊断查询并尝试从 subgraph 重建..."
-        )
-        # ---- 诊断：查看该 kb_id 下有哪些类型的数据 ----
-        diag_query = {
-            "query": {"bool": {"filter": [{"term": {"kb_id": KB_ID}}]}},
-            "size": 0,
-            "aggs": {"kg_types": {"terms": {"field": "knowledge_graph_kwd", "size": 10}}},
-        }
-        has_subgraph = False
+        content = {}
         try:
-            diag_resp = requests.post(search_url, json=diag_query, auth=auth, timeout=30)
-            if diag_resp.status_code == 200:
-                diag_result = diag_resp.json()
-                buckets = diag_result.get("aggregations", {}).get("kg_types", {}).get("buckets", [])
-                if buckets:
-                    logger.info("诊断结果：该知识库在 OpenSearch 中的数据分布如下：")
-                    for b in buckets:
-                        logger.info("  - %s: %s 条", b["key"], b["doc_count"])
-                        if b["key"] == "subgraph":
-                            has_subgraph = True
-                else:
-                    logger.error("诊断结果：该 kb_id 在 OpenSearch 中无任何文档。")
-                    return None
-            else:
-                logger.error("诊断查询失败: HTTP %s, %s", diag_resp.status_code, diag_resp.text)
-                return None
-        except Exception as exc:
-            logger.error("诊断查询异常: %s", exc)
-            return None
+            content = json.loads(source.get("content_with_weight", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-        # ---- Fallback：从 subgraph 文档重建完整图 ----
-        if not has_subgraph:
-            logger.error("该知识库既没有 graph 文档，也没有 subgraph 文档，无法重建。")
-            return None
-
-        subgraph_query = {
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"kb_id": KB_ID}},
-                        {"term": {"knowledge_graph_kwd": "subgraph"}},
-                    ]
-                }
-            },
-            "size": 1000,
+        attrs = {
+            "entity_type": source.get("entity_type_kwd", ""),
+            "description": content.get("description", ""),
+            "source_id": source.get("source_id", []),
+            "rank": content.get("rank", ""),
+            "doc_id": source.get("id", ""),
         }
-        logger.info("正在从 subgraph 文档重建完整知识图谱...")
+        if source.get("important_kwd"):
+            attrs["important_kwd"] = source["important_kwd"]
+        if source.get("title_tks"):
+            attrs["title_tks"] = source["title_tks"]
+
+        G.add_node(entity_name, **attrs)
+        node_count += 1
+
+    edge_count = 0
+    for hit in relation_hits:
+        source = hit.get("_source", {})
+        from_entity = source.get("from_entity_kwd")
+        to_entity = source.get("to_entity_kwd")
+        if not from_entity or not to_entity:
+            continue
+
+        content = {}
         try:
-            sg_resp = requests.post(search_url, json=subgraph_query, auth=auth, timeout=60)
-            sg_resp.raise_for_status()
-            sg_result = sg_resp.json()
-        except Exception as exc:
-            logger.error("查询 subgraph 文档失败: %s", exc)
-            return None
+            content = json.loads(source.get("content_with_weight", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-        sg_hits = sg_result.get("hits", {}).get("hits", [])
-        if not sg_hits:
-            logger.error("subgraph 查询返回空结果，无法重建。")
-            return None
+        attrs = {
+            "description": content.get("description", ""),
+            "keywords": content.get("keywords", []),
+            "weight": content.get("weight", ""),
+            "source_id": source.get("source_id", []),
+            "doc_id": source.get("id", ""),
+        }
+        if source.get("weight_int") is not None:
+            attrs["weight_int"] = source["weight_int"]
+        if source.get("important_kwd"):
+            attrs["important_kwd"] = source["important_kwd"]
 
-        merged = nx.Graph()
-        for idx, hit in enumerate(sg_hits, 1):
-            try:
-                sg_data = json.loads(hit["_source"]["content_with_weight"])
-                source_ids = hit["_source"].get("source_id", [])
-                sg_graph = nx.node_link_graph(sg_data, edges="edges")
-                logger.info(
-                    "  Subgraph %s/%s: source_id=%s, nodes=%s, edges=%s",
-                    idx, len(sg_hits), source_ids,
-                    sg_graph.number_of_nodes(), sg_graph.number_of_edges(),
-                )
-                merged = nx.compose(merged, sg_graph)
-            except Exception as exc:
-                logger.warning("  Subgraph %s/%s 解析失败，已跳过: %s", idx, len(sg_hits), exc)
-                continue
+        G.add_edge(from_entity, to_entity, **attrs)
+        edge_count += 1
 
-        if merged.number_of_nodes() == 0:
-            logger.error("所有 subgraph 文档解析后节点数为 0，重建失败。")
-            return None
-
-        graph_data = nx.node_link_data(merged, edges="edges")
-        node_count = len(graph_data.get("nodes", []))
-        edge_count = len(graph_data.get("edges", []))
-        logger.info(
-            "成功从 %s 条 subgraph 重建完整知识图谱: %s 个节点, %s 条边",
-            len(sg_hits), node_count, edge_count,
-        )
-        return {"graph": graph_data}
-
-    # ---- 3. 解析 content_with_weight 中的图数据 ----
-    try:
-        source = hits[0]["_source"]
-        graph_data = json.loads(source["content_with_weight"])
-    except Exception as exc:
-        logger.error("解析 graph 文档 content_with_weight 失败: %s", exc)
-        return None
-
-    node_count = len(graph_data.get("nodes", []))
-    edge_count = len(graph_data.get("edges", []))
+    graph_data = nx.node_link_data(G)
     logger.info(
-        "成功从 OpenSearch 获取完整知识图谱: %s 个节点, %s 条边",
+        "成功从 OpenSearch 构建知识图谱: %s 个节点, %s 条边",
         node_count, edge_count,
     )
 
     return {"graph": graph_data}
+
+
+def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_size=1000):
+    """绕过 API，直接从 OpenSearch 流式读取并导出 CSV。
+
+    流程：
+      1. 先通过 _count API 统计实体总数和关系总数；
+      2. 分两个阶段 scroll 拉取：
+         - 阶段一：读取实体文档，逐批追加写入 nodes.csv；
+         - 阶段二：读取关系文档，逐批追加写入 edges.csv；
+      3. 若关系引用了尚未写入的节点，自动在 nodes.csv 中补录空节点。
+    每批次均打印分数形式的进度日志（当前/总数）。
+    """
+    kb_id = kb_id or KB_ID
+    output_dir = output_dir or OUTPUT_DIR or os.path.dirname(output_prefix or OUTPUT_PREFIX)
+    base_name = os.path.basename(output_prefix or OUTPUT_PREFIX) or "output"
+
+    tenant_id = _get_tenant_id()
+    if not tenant_id:
+        return False
+
+    os_host = getattr(config, "OPENSEARCH_HOST", "localhost")
+    os_port = getattr(config, "OPENSEARCH_PORT", 9201)
+    os_user = getattr(config, "OPENSEARCH_USER", "admin")
+    os_pass = getattr(config, "OPENSEARCH_PASSWORD", "")
+    os_ssl = getattr(config, "OPENSEARCH_USE_SSL", False)
+    scheme = "https" if os_ssl else "http"
+
+    index_name = f"ragflow_{tenant_id}"
+    search_url = f"{scheme}://{os_host}:{os_port}/{index_name}/_search"
+    count_url = f"{scheme}://{os_host}:{os_port}/{index_name}/_count"
+    auth = (os_user, os_pass) if os_user else None
+
+    entity_query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"term": {"kb_id": kb_id}},
+                    {"term": {"knowledge_graph_kwd": "entity"}},
+                ]
+            }
+        }
+    }
+    relation_query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"term": {"kb_id": kb_id}},
+                    {"term": {"knowledge_graph_kwd": "relation"}},
+                ]
+            }
+        }
+    }
+
+    # ---- 先统计数量 ----
+    logger.info("正在统计 OpenSearch 中实体与关系文档数量...")
+    entity_total = _count_os_docs(count_url, entity_query, auth)
+    relation_total = _count_os_docs(count_url, relation_query, auth)
+    if entity_total is None or relation_total is None:
+        logger.error("统计文档数量失败，导出终止。")
+        return False
+
+    logger.info("OpenSearch 统计结果: 实体 %s 个, 关系 %s 个", entity_total, relation_total)
+
+    if entity_total == 0 and relation_total == 0:
+        logger.error("该知识库在 OpenSearch 中没有任何实体或关系文档，导出终止。")
+        return False
+
+    # ---- 准备 CSV 路径 ----
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    nodes_csv = os.path.join(output_dir, f"{base_name}_{kb_id}_nodes.csv")
+    edges_csv = os.path.join(output_dir, f"{base_name}_{kb_id}_edges.csv")
+
+    # 若文件已存在则先删除，避免追加到旧数据
+    for f in (nodes_csv, edges_csv):
+        if os.path.exists(f):
+            os.remove(f)
+
+    known_nodes = set()
+    nodes_header_written = False
+    edges_header_written = False
+
+    # ---- 阶段一：流式导出实体 ----
+    logger.info("开始流式导出节点 CSV (总数 %s)...", entity_total)
+    total_nodes_written = 0
+    batch_idx = 0
+
+    for batch in _scroll_search_batches(search_url, entity_query, auth, scheme, os_host, os_port, batch_size):
+        batch_idx += 1
+        rows = []
+        for hit in batch:
+            source = hit.get("_source", {})
+            entity_name = source.get("entity_kwd")
+            if not entity_name:
+                continue
+
+            content = {}
+            try:
+                content = json.loads(source.get("content_with_weight", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            row = {
+                "id": entity_name,
+                "entity_type": source.get("entity_type_kwd", ""),
+                "description": content.get("description", ""),
+                "source_id": source.get("source_id", []),
+                "rank": content.get("rank", ""),
+                "doc_id": source.get("id", ""),
+            }
+            if source.get("important_kwd"):
+                row["important_kwd"] = source["important_kwd"]
+            if source.get("title_tks"):
+                row["title_tks"] = source["title_tks"]
+
+            for k, v in list(row.items()):
+                row[k] = _escape_csv_injection(_safe_serialize(v))
+
+            rows.append(row)
+            known_nodes.add(entity_name)
+
+        if rows:
+            df = pd.DataFrame(rows)
+            df.to_csv(
+                nodes_csv,
+                mode="a",
+                header=not nodes_header_written,
+                index=False,
+                encoding="utf-8-sig",
+            )
+            nodes_header_written = True
+            total_nodes_written += len(rows)
+            logger.info(
+                "节点写入批次 %s: 本批 %s 条，累计 %s/%s 条",
+                batch_idx, len(rows), total_nodes_written, entity_total,
+            )
+
+    # ---- 阶段二：流式导出关系 ----
+    logger.info("开始流式导出边 CSV (总数 %s)...", relation_total)
+    total_edges_written = 0
+    batch_idx = 0
+    missing_nodes_added = 0
+
+    for batch in _scroll_search_batches(search_url, relation_query, auth, scheme, os_host, os_port, batch_size):
+        batch_idx += 1
+        rows = []
+        missing_rows = []
+        for hit in batch:
+            source = hit.get("_source", {})
+            from_entity = source.get("from_entity_kwd")
+            to_entity = source.get("to_entity_kwd")
+            if not from_entity or not to_entity:
+                continue
+
+            content = {}
+            try:
+                content = json.loads(source.get("content_with_weight", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            # 补录缺失节点
+            for node_name in (from_entity, to_entity):
+                if node_name not in known_nodes:
+                    missing_rows.append({"id": node_name})
+                    known_nodes.add(node_name)
+                    missing_nodes_added += 1
+
+            row = {
+                "source": from_entity,
+                "target": to_entity,
+                "description": content.get("description", ""),
+                "keywords": content.get("keywords", []),
+                "weight": content.get("weight", ""),
+                "source_id": source.get("source_id", []),
+                "doc_id": source.get("id", ""),
+            }
+            if source.get("weight_int") is not None:
+                row["weight_int"] = source["weight_int"]
+            if source.get("important_kwd"):
+                row["important_kwd"] = source["important_kwd"]
+
+            for k, v in list(row.items()):
+                row[k] = _escape_csv_injection(_safe_serialize(v))
+
+            rows.append(row)
+
+        # 先补录本批次发现的缺失节点
+        if missing_rows:
+            df_missing = pd.DataFrame(missing_rows)
+            for k, v in list(df_missing.items()):
+                df_missing[k] = df_missing[k].apply(lambda x: _escape_csv_injection(_safe_serialize(x)))
+            df_missing.to_csv(
+                nodes_csv,
+                mode="a",
+                header=not nodes_header_written,
+                index=False,
+                encoding="utf-8-sig",
+            )
+            nodes_header_written = True
+
+        if rows:
+            df = pd.DataFrame(rows)
+            df.to_csv(
+                edges_csv,
+                mode="a",
+                header=not edges_header_written,
+                index=False,
+                encoding="utf-8-sig",
+            )
+            edges_header_written = True
+            total_edges_written += len(rows)
+            logger.info(
+                "关系写入批次 %s: 本批 %s 条，累计 %s/%s 条（补录节点 %s 个）",
+                batch_idx, len(rows), total_edges_written, relation_total, len(missing_rows),
+            )
+
+    logger.info(
+        "流式导出完成: 节点 %s 个（含补录 %s 个），关系 %s 条。CSV: %s, %s",
+        total_nodes_written + missing_nodes_added,
+        missing_nodes_added,
+        total_edges_written,
+        nodes_csv,
+        edges_csv,
+    )
+    return True
 
 
 def export_graph(data):

@@ -4,7 +4,7 @@ import os
 import sys
 
 import config
-from exporter import fetch_knowledge_graph, fetch_knowledge_graph_direct, export_graph
+from exporter import fetch_knowledge_graph, fetch_knowledge_graph_direct, export_graph, export_graph_direct
 from neo4j_importer import Neo4jWriter
 
 logging.basicConfig(
@@ -82,17 +82,16 @@ def action_import_only():
 
 def action_export_direct():
     logger.info("开始从 OpenSearch 直连导出 CSV...")
-    data = fetch_knowledge_graph_direct()
-    if data:
-        export_graph(data)
+    success = export_graph_direct()
+    if success:
         nodes, edges = _default_csv_paths()
         logger.info("CSV 导出完成: %s, %s", nodes, edges)
     else:
-        logger.error("从 OpenSearch 获取数据失败，导出终止。")
+        logger.error("从 OpenSearch 导出失败，导出终止。")
 
 
-def _run_export_import(data_fetcher, export_label):
-    """统一的导出+导入执行逻辑"""
+def _run_export_import_api(data_fetcher, export_label):
+    """统一的 API 导出 + 导入执行逻辑"""
     logger.info("步骤 1/2: %s...", export_label)
     data = data_fetcher()
     if not data:
@@ -100,6 +99,33 @@ def _run_export_import(data_fetcher, export_label):
         return
 
     export_graph(data)
+    nodes, edges = _default_csv_paths()
+    logger.info("CSV 导出完成: %s, %s", nodes, edges)
+
+    logger.info("步骤 2/2: 导入 Neo4j...")
+    with Neo4jWriter() as writer:
+        if not writer.test_connection():
+            logger.error("无法连接到 Neo4j，请检查配置。")
+            return
+
+        clear = input("是否先清空 Neo4j 数据库？数据将不可恢复！ [y/N]: ").strip().lower()
+        if clear == 'y':
+            writer.clear_database()
+
+        writer.import_nodes(nodes)
+        writer.import_edges(edges)
+
+    logger.info("自动流程执行完毕！")
+
+
+def _run_export_import_direct():
+    """OpenSearch 直连流式导出 + 导入执行逻辑"""
+    logger.info("步骤 1/2: 从 OpenSearch 直连导出 CSV...")
+    success = export_graph_direct()
+    if not success:
+        logger.error("导出失败，自动流程终止。")
+        return
+
     nodes, edges = _default_csv_paths()
     logger.info("CSV 导出完成: %s, %s", nodes, edges)
 
@@ -128,9 +154,9 @@ def action_auto():
     sub = input("请输入选项 [a/b]: ").strip().lower()
 
     if sub == "a":
-        _run_export_import(fetch_knowledge_graph, "从 RagFlow API 导出 CSV")
+        _run_export_import_api(fetch_knowledge_graph, "从 RagFlow API 导出 CSV")
     elif sub == "b":
-        _run_export_import(fetch_knowledge_graph_direct, "从 OpenSearch 直连导出 CSV")
+        _run_export_import_direct()
     else:
         print("无效选项，返回主菜单。")
 

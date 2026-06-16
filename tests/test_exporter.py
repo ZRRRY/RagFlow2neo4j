@@ -156,28 +156,37 @@ class TestFetchKnowledgeGraphDirect:
         mock_session.get = mock.Mock(return_value=mock_resp, side_effect=side_effect)
         return mock_session
 
-    def _entity_hit(self, entity_kwd, entity_type_kwd="", content=None, source_id=None, doc_id=""):
+    def _entity_hit(self, entity_name, entity_type="", description="", source_id=None, pagerank="", rank="", doc_id=""):
+        content = {
+            "entity_name": entity_name,
+            "entity_type": entity_type,
+            "description": description,
+            "source_id": source_id or [],
+            "pagerank": pagerank,
+            "rank": rank,
+        }
         return {
             "_source": {
-                "entity_kwd": entity_kwd,
-                "entity_type_kwd": entity_type_kwd,
-                "content_with_weight": json.dumps(content) if content else "{}",
-                "source_id": source_id or [],
+                "content_with_weight": json.dumps(content),
                 "id": doc_id,
             }
         }
 
-    def _relation_hit(self, from_entity, to_entity, content=None, source_id=None, doc_id="", weight_int=None):
-        src = {
-            "from_entity_kwd": from_entity,
-            "to_entity_kwd": to_entity,
-            "content_with_weight": json.dumps(content) if content else "{}",
+    def _relation_hit(self, src_id, tgt_id, description="", keywords=None, weight="", source_id=None, doc_id=""):
+        content = {
+            "src_id": src_id,
+            "tgt_id": tgt_id,
+            "description": description,
+            "keywords": keywords or [],
+            "weight": weight,
             "source_id": source_id or [],
-            "id": doc_id,
         }
-        if weight_int is not None:
-            src["weight_int"] = weight_int
-        return {"_source": src}
+        return {
+            "_source": {
+                "content_with_weight": json.dumps(content),
+                "id": doc_id,
+            }
+        }
 
     @mock.patch("exporter._scroll_search_batches")
     @mock.patch("exporter._get_session")
@@ -189,14 +198,14 @@ class TestFetchKnowledgeGraphDirect:
             if kg_kwd == "entity":
                 return [
                     [
-                        self._entity_hit("ENTITY_A", "PERSON", {"description": "desc A", "rank": 3}, ["doc1"], "e1"),
-                        self._entity_hit("ENTITY_B", "COMPANY", {"description": "desc B"}, ["doc2"], "e2"),
+                        self._entity_hit("ENTITY_A", "PERSON", "desc A", ["doc1"], 0.001, 3, "e1"),
+                        self._entity_hit("ENTITY_B", "COMPANY", "desc B", ["doc2"], 0.002, 2, "e2"),
                     ]
                 ]
             else:
                 return [
                     [
-                        self._relation_hit("ENTITY_A", "ENTITY_B", {"description": "rel desc", "weight": 1.5, "keywords": ["k1"]}, ["doc1"], "r1", 1),
+                        self._relation_hit("ENTITY_A", "ENTITY_B", "rel desc", ["k1"], 1.5, ["doc1"], "r1"),
                     ]
                 ]
 
@@ -247,14 +256,14 @@ class TestFetchKnowledgeGraphDirect:
                 return [
                     [
                         {"_source": {"entity_kwd": "VALID_ENTITY", "content_with_weight": "bad json"}},
-                        self._entity_hit("GOOD_ENTITY", "TYPE", {"description": "ok"}, [], "e2"),
+                        self._entity_hit("GOOD_ENTITY", "TYPE", "ok", [], 0.0, 0, "e2"),
                     ]
                 ]
             else:
                 return [
                     [
                         {"_source": {"from_entity_kwd": "", "to_entity_kwd": "GOOD_ENTITY", "content_with_weight": "{}"}},
-                        self._relation_hit("VALID_ENTITY", "GOOD_ENTITY", {"weight": 2.0}, [], "r1"),
+                        self._relation_hit("VALID_ENTITY", "GOOD_ENTITY", "", [], 2.0, [], "r1"),
                     ]
                 ]
 
@@ -265,8 +274,8 @@ class TestFetchKnowledgeGraphDirect:
         node_ids = {n["id"] for n in graph["nodes"]}
         assert node_ids == {"VALID_ENTITY", "GOOD_ENTITY"}
         assert len(graph["edges"]) == 1
-        assert graph["edges"][0]["source"] == "VALID_ENTITY"
-        assert graph["edges"][0]["target"] == "GOOD_ENTITY"
+        edge_endpoints = {graph["edges"][0]["source"], graph["edges"][0]["target"]}
+        assert edge_endpoints == {"VALID_ENTITY", "GOOD_ENTITY"}
 
     @mock.patch("exporter.requests.delete")
     @mock.patch("exporter.requests.post")
@@ -356,13 +365,13 @@ class TestExportGraphDirect:
         mock_scroll.side_effect = self._make_scroll_mock(
             entity_batches=[
                 [
-                    {"_source": {"entity_kwd": "A", "entity_type_kwd": "T", "content_with_weight": json.dumps({"description": "dA"}), "source_id": ["doc1"], "id": "e1"}},
-                    {"_source": {"entity_kwd": "B", "entity_type_kwd": "T", "content_with_weight": json.dumps({"description": "dB"}), "source_id": ["doc2"], "id": "e2"}},
+                    {"_source": {"content_with_weight": json.dumps({"entity_name": "A", "entity_type": "T", "description": "dA", "source_id": ["doc1"], "pagerank": 0.1, "rank": 1})}},
+                    {"_source": {"content_with_weight": json.dumps({"entity_name": "B", "entity_type": "T", "description": "dB", "source_id": ["doc2"], "pagerank": 0.2, "rank": 2})}},
                 ]
             ],
             relation_batches=[
                 [
-                    {"_source": {"from_entity_kwd": "A", "to_entity_kwd": "B", "content_with_weight": json.dumps({"weight": 1.0, "keywords": ["k1"]}), "source_id": ["doc1"], "id": "r1"}},
+                    {"_source": {"content_with_weight": json.dumps({"src_id": "A", "tgt_id": "B", "description": "", "keywords": ["k1"], "weight": 1.0, "source_id": ["doc1"]})}},
                 ]
             ],
         )
@@ -401,44 +410,6 @@ class TestExportGraphDirect:
         mock_count.return_value = 0
         result = exporter.export_graph_direct(kb_id="test_kb")
         assert result is False
-
-    @mock.patch("exporter._scroll_search_batches")
-    @mock.patch("exporter._count_os_docs")
-    @mock.patch("exporter._get_tenant_id")
-    def test_missing_node_backfill(self, mock_tenant, mock_count, mock_scroll, tmp_path):
-        """关系引用了不在实体文档中的节点时，应自动补录到 nodes.csv"""
-        mock_tenant.return_value = "t-123"
-        mock_count.side_effect = lambda count_url, query, auth: (
-            1 if query["query"]["bool"]["filter"][1]["term"]["knowledge_graph_kwd"] == "entity" else 1
-        )
-        mock_scroll.side_effect = self._make_scroll_mock(
-            entity_batches=[
-                [
-                    {"_source": {"entity_kwd": "A", "entity_type_kwd": "T", "content_with_weight": "{}", "source_id": [], "id": "e1"}},
-                ]
-            ],
-            relation_batches=[
-                [
-                    {"_source": {"from_entity_kwd": "A", "to_entity_kwd": "C", "content_with_weight": "{}", "source_id": [], "id": "r1"}},
-                ]
-            ],
-        )
-
-        prefix = str(tmp_path / "backfill")
-        old_prefix = exporter.OUTPUT_PREFIX
-        exporter.OUTPUT_PREFIX = prefix
-        try:
-            result = exporter.export_graph_direct(kb_id="test_kb", output_prefix=prefix)
-            assert result is True
-            nodes_file, edges_file = self._csv_paths(prefix)
-            nodes_df = pd.read_csv(nodes_file)
-            edges_df = pd.read_csv(edges_file)
-            assert len(nodes_df) == 2  # A + 补录的 C
-            assert len(edges_df) == 1
-            assert set(nodes_df["id"].tolist()) == {"A", "C"}
-        finally:
-            exporter.OUTPUT_PREFIX = old_prefix
-
 
 class TestExportGraph:
     def _csv_paths(self, prefix):

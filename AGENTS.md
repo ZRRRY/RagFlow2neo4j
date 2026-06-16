@@ -132,9 +132,11 @@ from neo4j_importer import Neo4jWriter
 - `fetch_knowledge_graph_direct()` —— 绕过 RAGFlow API，直接从底层 OpenSearch 读取实体和关系文档构建完整图谱。实现步骤：
   1. 通过 RAGFlow Dataset API 获取 `tenant_id`；
   2. 构造 OpenSearch 索引名 `ragflow_{tenant_id}`，使用 scroll API 分别查询 `knowledge_graph_kwd="entity"` 的实体文档和 `knowledge_graph_kwd="relation"` 的关系文档；
-  3. 解析实体文档构建节点（以 `entity_kwd` 为节点 ID），解析关系文档构建边（以 `from_entity_kwd` / `to_entity_kwd` 为起止节点），组装为 NetworkX 图对象。
-  返回格式与 `fetch_knowledge_graph()` 保持一致：`{"graph": <dict>}`。
-- `export_graph_direct(kb_id, output_dir, output_prefix, batch_size)` —— 流式导出：先 `_count` 统计实体/关系总数，再分两个阶段 scroll 拉取并追加写入 CSV。每批次打印 `当前/总数` 分数进度日志；若关系引用缺失节点，自动补录到 nodes.csv。
+  3. 仅解析文档的 `content_with_weight` 字段：
+     - 实体：取其中的 `entity_name`（作为节点 ID）、`entity_type`、`description`、`source_id`、`pagerank`、`rank`；
+     - 关系：取其中的 `src_id`（作为边起点）、`tgt_id`（作为边终点）、`description`、`keywords`、`weight`、`source_id`。
+  4. 组装为 NetworkX 图对象，返回格式与 `fetch_knowledge_graph()` 保持一致：`{"graph": <dict>}`。
+- `export_graph_direct(kb_id, output_dir, output_prefix, batch_size)` —— 流式导出：先 `_count` 统计实体/关系总数，再分两个阶段 scroll 拉取并追加写入 CSV。每批次打印 `当前/总数` 分数进度日志；仅保留 `content_with_weight` 中的 6 个字段。
 - `export_graph(data)` —— 将 API 数据转为 NetworkX 图对象，清洗属性后导出为两个 CSV 文件。
 
 ### `neo4j_importer.py`
@@ -189,7 +191,7 @@ pytest tests/
   - `TestFetchKnowledgeGraph`：使用 `mock.patch("exporter._get_session")` 覆盖成功、HTTP 错误、API 错误码、JSON 解析异常、网络异常。
   - `TestFetchKnowledgeGraphDirect`：覆盖 OpenSearch 实体/关系文档读取成功、Dataset API HTTP 错误、Dataset API 错误码、OpenSearch 空结果、跳过无效记录、scroll 分页拉取逻辑等场景。
   - `TestCountOsDocs`：覆盖 OpenSearch `_count` 成功与异常场景。
-  - `TestExportGraphDirect`：覆盖流式导出成功、计数失败、空结果、缺失节点自动补录等场景。
+  - `TestExportGraphDirect`：覆盖流式导出成功、计数失败、空结果等场景。
   - `TestExportGraph`：覆盖空图导出、带数据图导出、异常数据类型、缺少 `graph` 字段。
 - `tests/test_neo4j_importer.py`
   - `TestSanitizeRelType`：验证合法/非法关系类型名称的回退行为。

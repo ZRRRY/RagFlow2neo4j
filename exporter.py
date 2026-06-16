@@ -21,6 +21,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # ------------------------------------------
 
+# OpenSearch 直连导出时，节点与边仅保留 content_with_weight 中的字段
+_DIRECT_NODE_COLUMNS = ["id", "entity_type", "description", "source_id", "pagerank", "rank"]
+_DIRECT_EDGE_COLUMNS = ["source", "target", "description", "keywords", "weight", "source_id"]
+
 # ----------------- 从 config 读取配置 -----------------
 RAGFLOW_API_KEY = config.RAGFLOW_API_KEY
 KB_ID = config.KB_ID
@@ -292,27 +296,23 @@ def fetch_knowledge_graph_direct():
     node_count = 0
     for hit in entity_hits:
         source = hit.get("_source", {})
-        entity_name = source.get("entity_kwd")
-        if not entity_name:
-            continue
-
         content = {}
         try:
             content = json.loads(source.get("content_with_weight", "{}"))
         except (json.JSONDecodeError, TypeError):
             pass
 
+        entity_name = content.get("entity_name")
+        if not entity_name:
+            continue
+
         attrs = {
-            "entity_type": source.get("entity_type_kwd", ""),
+            "entity_type": content.get("entity_type", ""),
             "description": content.get("description", ""),
-            "source_id": source.get("source_id", []),
+            "source_id": content.get("source_id", []),
+            "pagerank": content.get("pagerank", ""),
             "rank": content.get("rank", ""),
-            "doc_id": source.get("id", ""),
         }
-        if source.get("important_kwd"):
-            attrs["important_kwd"] = source["important_kwd"]
-        if source.get("title_tks"):
-            attrs["title_tks"] = source["title_tks"]
 
         G.add_node(entity_name, **attrs)
         node_count += 1
@@ -320,28 +320,23 @@ def fetch_knowledge_graph_direct():
     edge_count = 0
     for hit in relation_hits:
         source = hit.get("_source", {})
-        from_entity = source.get("from_entity_kwd")
-        to_entity = source.get("to_entity_kwd")
-        if not from_entity or not to_entity:
-            continue
-
         content = {}
         try:
             content = json.loads(source.get("content_with_weight", "{}"))
         except (json.JSONDecodeError, TypeError):
             pass
 
+        from_entity = content.get("src_id")
+        to_entity = content.get("tgt_id")
+        if not from_entity or not to_entity:
+            continue
+
         attrs = {
             "description": content.get("description", ""),
             "keywords": content.get("keywords", []),
             "weight": content.get("weight", ""),
-            "source_id": source.get("source_id", []),
-            "doc_id": source.get("id", ""),
+            "source_id": content.get("source_id", []),
         }
-        if source.get("weight_int") is not None:
-            attrs["weight_int"] = source["weight_int"]
-        if source.get("important_kwd"):
-            attrs["important_kwd"] = source["important_kwd"]
 
         G.add_edge(from_entity, to_entity, **attrs)
         edge_count += 1
@@ -432,7 +427,6 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
         if os.path.exists(f):
             os.remove(f)
 
-    known_nodes = set()
     nodes_header_written = False
     edges_header_written = False
 
@@ -446,37 +440,32 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
         rows = []
         for hit in batch:
             source = hit.get("_source", {})
-            entity_name = source.get("entity_kwd")
-            if not entity_name:
-                continue
-
             content = {}
             try:
                 content = json.loads(source.get("content_with_weight", "{}"))
             except (json.JSONDecodeError, TypeError):
                 pass
 
+            entity_name = content.get("entity_name")
+            if not entity_name:
+                continue
+
             row = {
                 "id": entity_name,
-                "entity_type": source.get("entity_type_kwd", ""),
+                "entity_type": content.get("entity_type", ""),
                 "description": content.get("description", ""),
-                "source_id": source.get("source_id", []),
+                "source_id": content.get("source_id", []),
+                "pagerank": content.get("pagerank", ""),
                 "rank": content.get("rank", ""),
-                "doc_id": source.get("id", ""),
             }
-            if source.get("important_kwd"):
-                row["important_kwd"] = source["important_kwd"]
-            if source.get("title_tks"):
-                row["title_tks"] = source["title_tks"]
 
             for k, v in list(row.items()):
                 row[k] = _escape_csv_injection(_safe_serialize(v))
 
             rows.append(row)
-            known_nodes.add(entity_name)
 
         if rows:
-            df = pd.DataFrame(rows)
+            df = pd.DataFrame(rows, columns=_DIRECT_NODE_COLUMNS)
             df.to_csv(
                 nodes_csv,
                 mode="a",
@@ -495,31 +484,22 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
     logger.info("开始流式导出边 CSV (总数 %s)...", relation_total)
     total_edges_written = 0
     batch_idx = 0
-    missing_nodes_added = 0
 
     for batch in _scroll_search_batches(search_url, relation_query, auth, scheme, os_host, os_port, batch_size):
         batch_idx += 1
         rows = []
-        missing_rows = []
         for hit in batch:
             source = hit.get("_source", {})
-            from_entity = source.get("from_entity_kwd")
-            to_entity = source.get("to_entity_kwd")
-            if not from_entity or not to_entity:
-                continue
-
             content = {}
             try:
                 content = json.loads(source.get("content_with_weight", "{}"))
             except (json.JSONDecodeError, TypeError):
                 pass
 
-            # 补录缺失节点
-            for node_name in (from_entity, to_entity):
-                if node_name not in known_nodes:
-                    missing_rows.append({"id": node_name})
-                    known_nodes.add(node_name)
-                    missing_nodes_added += 1
+            from_entity = content.get("src_id")
+            to_entity = content.get("tgt_id")
+            if not from_entity or not to_entity:
+                continue
 
             row = {
                 "source": from_entity,
@@ -527,35 +507,16 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
                 "description": content.get("description", ""),
                 "keywords": content.get("keywords", []),
                 "weight": content.get("weight", ""),
-                "source_id": source.get("source_id", []),
-                "doc_id": source.get("id", ""),
+                "source_id": content.get("source_id", []),
             }
-            if source.get("weight_int") is not None:
-                row["weight_int"] = source["weight_int"]
-            if source.get("important_kwd"):
-                row["important_kwd"] = source["important_kwd"]
 
             for k, v in list(row.items()):
                 row[k] = _escape_csv_injection(_safe_serialize(v))
 
             rows.append(row)
 
-        # 先补录本批次发现的缺失节点
-        if missing_rows:
-            df_missing = pd.DataFrame(missing_rows)
-            for k, v in list(df_missing.items()):
-                df_missing[k] = df_missing[k].apply(lambda x: _escape_csv_injection(_safe_serialize(x)))
-            df_missing.to_csv(
-                nodes_csv,
-                mode="a",
-                header=not nodes_header_written,
-                index=False,
-                encoding="utf-8-sig",
-            )
-            nodes_header_written = True
-
         if rows:
-            df = pd.DataFrame(rows)
+            df = pd.DataFrame(rows, columns=_DIRECT_EDGE_COLUMNS)
             df.to_csv(
                 edges_csv,
                 mode="a",
@@ -566,14 +527,13 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
             edges_header_written = True
             total_edges_written += len(rows)
             logger.info(
-                "关系写入批次 %s: 本批 %s 条，累计 %s/%s 条（补录节点 %s 个）",
-                batch_idx, len(rows), total_edges_written, relation_total, len(missing_rows),
+                "关系写入批次 %s: 本批 %s 条，累计 %s/%s 条",
+                batch_idx, len(rows), total_edges_written, relation_total,
             )
 
     logger.info(
-        "流式导出完成: 节点 %s 个（含补录 %s 个），关系 %s 条。CSV: %s, %s",
-        total_nodes_written + missing_nodes_added,
-        missing_nodes_added,
+        "流式导出完成: 节点 %s 个，关系 %s 条。CSV: %s, %s",
+        total_nodes_written,
         total_edges_written,
         nodes_csv,
         edges_csv,

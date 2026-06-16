@@ -83,7 +83,13 @@ RagFlow2neo4j/
 | `OPENSEARCH_PASSWORD` | OpenSearch 密码（默认空字符串） |
 | `OPENSEARCH_USE_SSL` | 是否对 OpenSearch 使用 HTTPS（默认 `False`） |
 
-首次使用时，复制 `config.example.py` 为 `config.py` 并填写实际值。修改 `_ACTIVE_PROFILE` 的值即可切换配置集（例如 `"local"` ↔ `"remote"`）。`config.py` 在导入时会执行非空校验：若当前 profile 的 `ragflow.api_key`、`ragflow.kb_id`、`neo4j.password` 为空，会直接抛出 `ValueError`。
+首次使用时，复制 `config.example.py` 为 `config.py` 并填写实际值。修改 `_ACTIVE_PROFILE` 的值即可切换配置集（例如 `"local"` ↔ `"remote"`）。
+
+`config.py` 中集中定义了 `DEFAULTS`（所有配置项的默认值）与 `REQUIRED_CONFIG`（运行前必需项清单），并通过 `validate_config()` 函数在导入时及 CLI 启动前进行校验。目前必需项包括：
+- `ragflow.api_key`、`ragflow.kb_id`、`ragflow.base_url`
+- `neo4j.uri`、`neo4j.user`、`neo4j.password`
+
+若任一必需项为空或缺失，`config.py` 导入时会直接抛出 `ValueError`；CLI 启动前也会再次调用 `validate_config()` 并友好地列出所有缺失项。
 
 ### 2. 运行
 
@@ -126,6 +132,7 @@ from neo4j_importer import Neo4jWriter
 - `sanitize_attrs(G)` —— 递归处理图中所有节点、边及图级别的属性，确保 CSV 兼容性（非标量值 → JSON 字符串；`None` / `NaN` / `Infinity` → 空字符串）。
 - `_get_session()` —— 创建带重试机制的 `requests.Session`，对 500/502/503/504 的 GET 请求最多重试 3 次，退避因子为 1。
 - `_get_tenant_id()` —— 通过 RAGFlow Dataset API 获取 `tenant_id`，供 OpenSearch 直连使用。
+- `_read_opensearch_config()` —— 统一从 `config` 读取 OpenSearch 直连配置，避免默认值分散在业务代码中。
 - `fetch_knowledge_graph()` —— HTTP GET 请求 RAGFlow API（`/api/v1/datasets/{KB_ID}/graph/export`），返回解析后的 `data` 字典。
 - `_count_os_docs(count_url, query, auth)` —— 使用 OpenSearch `_count` API 获取符合条件的文档总数。
 - `_scroll_search_batches(search_url, query, auth, scheme, os_host, os_port, batch_size)` —— 生成器：使用 OpenSearch scroll API 逐批次 yield hits 列表，自动处理分页并清理 scroll 上下文。

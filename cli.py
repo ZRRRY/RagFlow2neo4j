@@ -162,6 +162,18 @@ def action_auto():
 
 
 def main():
+    # 运行前配置检查
+    try:
+        is_valid, missing = config.validate_config()
+        if not is_valid:
+            print("配置校验失败，请先完善 config.py 中的以下项：")
+            for item in missing:
+                print("  -", item)
+            sys.exit(1)
+    except Exception as exc:
+        print("配置校验异常:", exc)
+        sys.exit(1)
+
     while True:
         try:
             choice = menu()

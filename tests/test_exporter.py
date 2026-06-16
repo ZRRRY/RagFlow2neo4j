@@ -7,6 +7,7 @@ mock_config = mock.MagicMock()
 mock_config.RAGFLOW_API_KEY = "test_api_key"
 mock_config.KB_ID = "test_kb_id"
 mock_config.RAGFLOW_BASE_URL = "http://localhost:9380"
+mock_config.RAGFLOW_REQUEST_TIMEOUT = 120
 mock_config.OUTPUT_PREFIX = "test_output"
 mock_config.OUTPUT_DIR = ""
 mock_config.NEO4J_URI = "bolt://localhost:7687"

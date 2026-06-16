@@ -29,11 +29,21 @@ _DIRECT_EDGE_COLUMNS = ["source", "target", "description", "keywords", "weight",
 RAGFLOW_API_KEY = config.RAGFLOW_API_KEY
 KB_ID = config.KB_ID
 RAGFLOW_BASE_URL = config.RAGFLOW_BASE_URL
-OUTPUT_DIR = getattr(config, "OUTPUT_DIR", "")
+OUTPUT_DIR = config.OUTPUT_DIR
 OUTPUT_PREFIX = config.OUTPUT_PREFIX
-RAGFLOW_REQUEST_TIMEOUT = getattr(config, "RAGFLOW_REQUEST_TIMEOUT", 120)
+RAGFLOW_REQUEST_TIMEOUT = config.RAGFLOW_REQUEST_TIMEOUT
 # ----------------------------------------------------
-# https://rag.artroot.cn
+
+
+def _read_opensearch_config():
+    """统一从 config 读取 OpenSearch 直连配置。"""
+    return {
+        "host": config.OPENSEARCH_HOST,
+        "port": config.OPENSEARCH_PORT,
+        "user": config.OPENSEARCH_USER,
+        "password": config.OPENSEARCH_PASSWORD,
+        "use_ssl": config.OPENSEARCH_USE_SSL,
+    }
 
 
 def _escape_csv_injection(value):
@@ -244,12 +254,12 @@ def fetch_knowledge_graph_direct():
     if not tenant_id:
         return None
 
-    os_host = getattr(config, "OPENSEARCH_HOST", "localhost")
-    os_port = getattr(config, "OPENSEARCH_PORT", 9201)
-    os_user = getattr(config, "OPENSEARCH_USER", "admin")
-    os_pass = getattr(config, "OPENSEARCH_PASSWORD", "")
-    os_ssl = getattr(config, "OPENSEARCH_USE_SSL", False)
-    scheme = "https" if os_ssl else "http"
+    os_cfg = _read_opensearch_config()
+    os_host = os_cfg["host"]
+    os_port = os_cfg["port"]
+    os_user = os_cfg["user"]
+    os_pass = os_cfg["password"]
+    scheme = "https" if os_cfg["use_ssl"] else "http"
 
     index_name = f"ragflow_{tenant_id}"
     search_url = f"{scheme}://{os_host}:{os_port}/{index_name}/_search"
@@ -341,7 +351,7 @@ def fetch_knowledge_graph_direct():
         G.add_edge(from_entity, to_entity, **attrs)
         edge_count += 1
 
-    graph_data = nx.node_link_data(G)
+    graph_data = nx.node_link_data(G, edges="edges")
     logger.info(
         "成功从 OpenSearch 构建知识图谱: %s 个节点, %s 条边",
         node_count, edge_count,
@@ -369,12 +379,12 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
     if not tenant_id:
         return False
 
-    os_host = getattr(config, "OPENSEARCH_HOST", "localhost")
-    os_port = getattr(config, "OPENSEARCH_PORT", 9201)
-    os_user = getattr(config, "OPENSEARCH_USER", "admin")
-    os_pass = getattr(config, "OPENSEARCH_PASSWORD", "")
-    os_ssl = getattr(config, "OPENSEARCH_USE_SSL", False)
-    scheme = "https" if os_ssl else "http"
+    os_cfg = _read_opensearch_config()
+    os_host = os_cfg["host"]
+    os_port = os_cfg["port"]
+    os_user = os_cfg["user"]
+    os_pass = os_cfg["password"]
+    scheme = "https" if os_cfg["use_ssl"] else "http"
 
     index_name = f"ragflow_{tenant_id}"
     search_url = f"{scheme}://{os_host}:{os_port}/{index_name}/_search"
@@ -556,9 +566,9 @@ def export_graph(data):
     edges = graph_info.get("edges", [])
     logger.info("成功获取图谱: %s 个节点, %s 条边", len(nodes), len(edges))
 
-    # 构建 NetworkX 图
+    # 构建 NetworkX 图（使用 edges="edges" 以兼容 NetworkX 3.x+ 的默认行为）
     try:
-        G = nx.node_link_graph(graph_info)
+        G = nx.node_link_graph(graph_info, edges="edges")
     except Exception as exc:
         logger.error("NetworkX 建图失败: %s", exc)
         return

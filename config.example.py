@@ -21,8 +21,9 @@ _ACTIVE_PROFILE = "local"
 # 各 profile 可以只填写与环境相关的差异项，未填写的项将自动继承以下默认值。
 DEFAULTS = {
     # RAGFlow 通用配置
+    # 仅用于调用 Dataset API 获取 tenant_id，以构造搜索引擎索引名。
     "ragflow": {
-        # API 请求超时时间（秒）
+        # Dataset API 请求超时时间（秒）
         "request_timeout": 120,
     },
 
@@ -39,13 +40,22 @@ DEFAULTS = {
         "database": "neo4j",
     },
 
-    # OpenSearch 直连配置（可选）
-    # 当 RAGFlow /graph/export 接口因数据量过大触发 Internal server error 时，
-    # 可启用此配置绕过 API，直接从底层 OpenSearch 读取完整图谱数据。
+    # OpenSearch 直连配置
+    # 图谱数据通过 OpenSearch 的 _count + scroll API 流式拉取。
     "opensearch": {
         "host": "localhost",
         "port": 9201,
         "user": "admin",
+        "password": "",
+        "use_ssl": False,
+    },
+
+    # Elasticsearch 直连配置
+    # 图谱数据通过 Elasticsearch 的 _count + scroll API 流式拉取。
+    "elasticsearch": {
+        "host": "localhost",
+        "port": 9200,
+        "user": "",
         "password": "",
         "use_ssl": False,
     },
@@ -58,7 +68,7 @@ DEFAULTS = {
 # 若任一必填项为空或缺失，CLI 将拒绝启动并列出所有缺失项。
 REQUIRED_CONFIG = {
     "ragflow": [
-        "api_key",   # RAGFlow API 密钥
+        "api_key",   # RAGFlow API 密钥（仅用于获取 tenant_id）
         "kb_id",     # 知识库（Dataset）ID
         "base_url",  # RAGFlow 服务地址
     ],
@@ -84,7 +94,7 @@ _PROFILES = {
             "kb_id": "",
             # 必填：RAGFlow 服务地址
             "base_url": "http://localhost:9380",
-            # 可选：API 请求超时（秒），未填写则使用 DEFAULTS.ragflow.request_timeout
+            # 可选：Dataset API 请求超时（秒）
             # "request_timeout": 120,
         },
         "output": {
@@ -99,11 +109,20 @@ _PROFILES = {
             # "database": "neo4j",
         },
         "opensearch": {
-            # 以下配置仅在通过 OpenSearch 直连导出时使用
+            # 以下配置用于从 OpenSearch 流式导出图谱数据
             # 需要覆盖 DEFAULTS 时取消对应项的注释并填写实际值
             # "host": "localhost",
             # "port": 9201,
             # "user": "admin",
+            # "password": "",
+            # "use_ssl": False,
+        },
+        "elasticsearch": {
+            # 以下配置用于从 Elasticsearch 流式导出图谱数据
+            # 需要覆盖 DEFAULTS 时取消对应项的注释并填写实际值
+            # "host": "localhost",
+            # "port": 9200,
+            # "user": "",
             # "password": "",
             # "use_ssl": False,
         },
@@ -132,6 +151,14 @@ _PROFILES = {
             # "host": "localhost",
             # "port": 9201,
             # "user": "admin",
+            # "password": "",
+            # "use_ssl": False,
+        },
+        "elasticsearch": {
+            # 需要覆盖 DEFAULTS 时取消对应项的注释并填写实际值
+            # "host": "localhost",
+            # "port": 9200,
+            # "user": "",
             # "password": "",
             # "use_ssl": False,
         },
@@ -191,7 +218,7 @@ def validate_config():
 
 _cfg = _load_config()
 
-# RAGFlow 配置
+# RAGFlow 配置（仅用于获取 tenant_id）
 RAGFLOW_API_KEY = _cfg["ragflow"]["api_key"]
 KB_ID = _cfg["ragflow"]["kb_id"]
 RAGFLOW_BASE_URL = _cfg["ragflow"]["base_url"]
@@ -216,6 +243,14 @@ OPENSEARCH_PORT = _opensearch_cfg["port"]
 OPENSEARCH_USER = _opensearch_cfg["user"]
 OPENSEARCH_PASSWORD = _opensearch_cfg["password"]
 OPENSEARCH_USE_SSL = _opensearch_cfg["use_ssl"]
+
+# Elasticsearch 直连配置
+_elasticsearch_cfg = _cfg["elasticsearch"]
+ELASTICSEARCH_HOST = _elasticsearch_cfg["host"]
+ELASTICSEARCH_PORT = _elasticsearch_cfg["port"]
+ELASTICSEARCH_USER = _elasticsearch_cfg["user"]
+ELASTICSEARCH_PASSWORD = _elasticsearch_cfg["password"]
+ELASTICSEARCH_USE_SSL = _elasticsearch_cfg["use_ssl"]
 
 # 模块导入时执行一次校验，确保配置完整
 _is_valid, _missing = validate_config()

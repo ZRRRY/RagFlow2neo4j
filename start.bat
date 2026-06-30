@@ -39,7 +39,7 @@ echo.
 
 :: 检查并安装依赖
 echo [INFO] 检查依赖...
-python -c "import requests, networkx, pandas, neo4j" >nul 2>&1
+python -c "import requests, pandas, neo4j" >nul 2>&1
 if errorlevel 1 (
     echo [INFO] 依赖缺失，正在安装 requirements.txt...
     pip install -r requirements.txt

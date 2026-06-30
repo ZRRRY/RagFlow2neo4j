@@ -4,7 +4,7 @@ import os
 import sys
 
 import config
-from exporter import fetch_knowledge_graph, fetch_knowledge_graph_direct, export_graph, export_graph_direct
+from exporter import export_graph_direct
 from neo4j_importer import Neo4jWriter
 
 logging.basicConfig(
@@ -32,8 +32,8 @@ def menu():
     print("=" * 40)
     print("当前知识库 ID:", config.KB_ID)
     print("-" * 40)
-    print("1. 从 RagFlow API 导出 CSV")
-    print("2. 从 OpenSearch 直连导出 CSV")
+    print("1. 从 OpenSearch 流式导出 CSV")
+    print("2. 从 Elasticsearch 流式导出 CSV")
     print("3. 仅从 CSV 导入 Neo4j")
     print("4. 自动执行导出 + 导入 Neo4j")
     print("5. 退出")
@@ -42,15 +42,16 @@ def menu():
     return choice
 
 
-def action_export_api():
-    logger.info("开始从 RagFlow API 导出 CSV...")
-    data = fetch_knowledge_graph()
-    if data:
-        export_graph(data)
+def action_export_direct(engine):
+    """根据 engine 从 OpenSearch 或 Elasticsearch 流式导出 CSV。"""
+    label = "OpenSearch" if engine == "opensearch" else "Elasticsearch"
+    logger.info("开始从 %s 流式导出 CSV...", label)
+    success = export_graph_direct(engine=engine)
+    if success:
         nodes, edges = _default_csv_paths()
         logger.info("CSV 导出完成: %s, %s", nodes, edges)
     else:
-        logger.error("从 RagFlow 获取数据失败，导出终止。")
+        logger.error("从 %s 导出失败，导出终止。", label)
 
 
 def action_import_only():
@@ -80,48 +81,11 @@ def action_import_only():
     logger.info("Neo4j 导入完成！")
 
 
-def action_export_direct():
-    logger.info("开始从 OpenSearch 直连导出 CSV...")
-    success = export_graph_direct()
-    if success:
-        nodes, edges = _default_csv_paths()
-        logger.info("CSV 导出完成: %s, %s", nodes, edges)
-    else:
-        logger.error("从 OpenSearch 导出失败，导出终止。")
-
-
-def _run_export_import_api(data_fetcher, export_label):
-    """统一的 API 导出 + 导入执行逻辑"""
-    logger.info("步骤 1/2: %s...", export_label)
-    data = data_fetcher()
-    if not data:
-        logger.error("导出失败，自动流程终止。")
-        return
-
-    export_graph(data)
-    nodes, edges = _default_csv_paths()
-    logger.info("CSV 导出完成: %s, %s", nodes, edges)
-
-    logger.info("步骤 2/2: 导入 Neo4j...")
-    with Neo4jWriter() as writer:
-        if not writer.test_connection():
-            logger.error("无法连接到 Neo4j，请检查配置。")
-            return
-
-        clear = input("是否先清空 Neo4j 数据库？数据将不可恢复！ [y/N]: ").strip().lower()
-        if clear == 'y':
-            writer.clear_database()
-
-        writer.import_nodes(nodes)
-        writer.import_edges(edges)
-
-    logger.info("自动流程执行完毕！")
-
-
-def _run_export_import_direct():
-    """OpenSearch 直连流式导出 + 导入执行逻辑"""
-    logger.info("步骤 1/2: 从 OpenSearch 直连导出 CSV...")
-    success = export_graph_direct()
+def _run_export_import(engine):
+    """搜索引擎流式导出 + 导入执行逻辑"""
+    label = "OpenSearch" if engine == "opensearch" else "Elasticsearch"
+    logger.info("步骤 1/2: 从 %s 流式导出 CSV...", label)
+    success = export_graph_direct(engine=engine)
     if not success:
         logger.error("导出失败，自动流程终止。")
         return
@@ -148,15 +112,15 @@ def _run_export_import_direct():
 def action_auto():
     print("-" * 40)
     print("请选择导出方式：")
-    print("a. 使用 RagFlow API 导出")
-    print("b. 使用 OpenSearch 直连导出")
+    print("a. 使用 OpenSearch 流式导出")
+    print("b. 使用 Elasticsearch 流式导出")
     print("-" * 40)
     sub = input("请输入选项 [a/b]: ").strip().lower()
 
     if sub == "a":
-        _run_export_import_api(fetch_knowledge_graph, "从 RagFlow API 导出 CSV")
+        _run_export_import("opensearch")
     elif sub == "b":
-        _run_export_import_direct()
+        _run_export_import("elasticsearch")
     else:
         print("无效选项，返回主菜单。")
 
@@ -178,9 +142,9 @@ def main():
         try:
             choice = menu()
             if choice == "1":
-                action_export_api()
+                action_export_direct("opensearch")
             elif choice == "2":
-                action_export_direct()
+                action_export_direct("elasticsearch")
             elif choice == "3":
                 action_import_only()
             elif choice == "4":

@@ -6,12 +6,10 @@
 
 ## 功能特性
 
-- **一键导出**：调用 RAGFlow 开放 API，自动获取指定知识库的知识图谱 JSON 数据
-- **OpenSearch 直连**：当 RAGFlow API 因数据量过大触发内部错误时，支持绕过 API 直接从底层 OpenSearch 读取完整图谱
-- **图转换**：使用 NetworkX 构建图对象，递归清洗节点与边的属性
+- **双引擎流式导出**：绕过 RAGFlow `/graph/export` API，直接从底层 **OpenSearch** 或 **Elasticsearch** 读取完整图谱，适合大数据量
 - **CSV 导出**：自动序列化复杂类型、处理空值、转义 CSV 公式注入，生成标准 CSV 文件
 - **批量导入 Neo4j**：支持节点 `MERGE` 去重、按关系类型分组导入、每批 1000 条事务控制
-- **交互式 CLI**：菜单驱动的命令行界面，支持 API 导出、OpenSearch 导出、单独导入、自动全流程
+- **交互式 CLI**：菜单驱动的命令行界面，支持 OpenSearch 导出、Elasticsearch 导出、单独导入、自动全流程
 - **安全**：配置文件使用 Python 格式，真实配置被 `.gitignore` 隔离，避免敏感信息泄露
 
 ---
@@ -33,7 +31,6 @@ pip install -r requirements.txt
 
 依赖清单：
 - `requests>=2.28.0`
-- `networkx>=3.0`
 - `pandas>=1.5.0`
 - `neo4j>=5.0`
 - `pytest>=7.0.0`（仅开发测试需要）
@@ -56,7 +53,7 @@ _ACTIVE_PROFILE = "local"  # 切换配置集："local" 或 "remote"
 _PROFILES = {
     "local": {
         "ragflow": {
-            "api_key": "your-ragflow-api-key",
+            "api_key": "your-ragflow-api-key",   # 仅用于获取 tenant_id
             "kb_id": "your-knowledge-base-id",
             "base_url": "http://localhost:9380",
             "request_timeout": 120,
@@ -68,10 +65,17 @@ _PROFILES = {
             "password": "your-neo4j-password",
             "database": "neo4j",
         },
-        "opensearch": {  # 可选，用于直连绕过 API
+        "opensearch": {  # 可选，用于从 OpenSearch 流式导出
             "host": "localhost",
             "port": 9201,
             "user": "admin",
+            "password": "",
+            "use_ssl": False,
+        },
+        "elasticsearch": {  # 可选，用于从 Elasticsearch 流式导出
+            "host": "localhost",
+            "port": 9200,
+            "user": "",
             "password": "",
             "use_ssl": False,
         },
@@ -82,17 +86,18 @@ _PROFILES = {
 
 | 字段 | 说明 |
 |------|------|
-| `ragflow.api_key` | RAGFlow API 密钥 |
+| `ragflow.api_key` | RAGFlow API 密钥（仅用于获取 `tenant_id`） |
 | `ragflow.kb_id` | 目标知识库（Dataset）ID |
 | `ragflow.base_url` | RAGFlow 服务地址 |
-| `ragflow.request_timeout` | API 请求超时时间（秒），默认 120 |
+| `ragflow.request_timeout` | Dataset API 请求超时时间（秒），默认 120 |
 | `output.dir` | CSV 输出文件夹 |
 | `output.prefix` | CSV 文件名前缀 |
 | `neo4j.uri` | Neo4j Bolt 地址 |
 | `neo4j.user` | Neo4j 用户名 |
 | `neo4j.password` | Neo4j 密码 |
 | `neo4j.database` | Neo4j 数据库名（4.x+ 支持多数据库） |
-| `opensearch.*` | OpenSearch 直连配置（可选） |
+| `opensearch.*` | OpenSearch 流式导出配置（可选） |
+| `elasticsearch.*` | Elasticsearch 流式导出配置（可选） |
 
 > **注意**：`config.py` 已被 `.gitignore` 排除，不会被提交到版本控制，请放心填写真实密钥。
 
@@ -107,8 +112,8 @@ python cli.py
 ```
 
 菜单选项：
-- **1**：从 RagFlow API 导出 CSV
-- **2**：从 OpenSearch 直连导出 CSV（绕过 API，适合大数据量）
+- **1**：从 OpenSearch 流式导出 CSV
+- **2**：从 Elasticsearch 流式导出 CSV
 - **3**：仅从 CSV 导入 Neo4j
 - **4**：自动执行导出 + 导入 Neo4j（保留 CSV）
 - **5**：退出
@@ -118,12 +123,14 @@ Windows 用户也可以直接双击运行 `start.bat`，脚本会自动检测虚
 ### 作为 Python 库导入
 
 ```python
-from exporter import fetch_knowledge_graph, export_graph
+from exporter import export_graph_direct, export_graph_direct_elasticsearch
 from neo4j_importer import Neo4jWriter
 
-# 导出 CSV
-data = fetch_knowledge_graph()
-export_graph(data)
+# 从 OpenSearch 流式导出 CSV（默认）
+export_graph_direct()
+
+# 从 Elasticsearch 流式导出 CSV
+export_graph_direct_elasticsearch()
 
 # 导入 Neo4j
 with Neo4jWriter() as writer:
@@ -141,7 +148,7 @@ RagFlow2neo4j/
 ├── config.py                # 真实配置文件（gitignored）
 ├── config.example.py        # 配置示例模板（Python 格式，支持多 profile）
 ├── cli.py                   # 交互式 CLI 入口
-├── exporter.py              # RAGFlow API 请求、OpenSearch 直连、图转换、CSV 导出
+├── exporter.py              # RAGFlow Dataset API 取 tenant_id、OpenSearch/Elasticsearch 流式导出、CSV 导出
 ├── neo4j_importer.py        # Neo4j 批量写入封装
 ├── requirements.txt         # 依赖清单
 ├── start.bat                # Windows 一键启动脚本
@@ -157,12 +164,6 @@ RagFlow2neo4j/
 
 ---
 
-## 数据格式说明
-
-RAGFlow `/api/v1/datasets/{KB_ID}/graph/export` 接口返回的 JSON 结构详细说明，请参阅 [docs/ragflow_api_data_format.md](docs/ragflow_api_data_format.md)。
-
----
-
 ## 运行测试
 
 ```bash
@@ -170,10 +171,10 @@ pytest tests/ -v
 ```
 
 当前覆盖：
-- 属性清洗（None/NaN/Infinity、JSON 序列化、CSV 注入转义）
-- RAGFlow API 请求（成功、HTTP 错误、API 错误码、网络异常）
-- OpenSearch 直连（查询构造、数据转换）
-- CSV 导出（空图、带数据图、异常数据）
+- 属性序列化（None/NaN/Infinity、JSON 序列化）
+- CSV 注入转义
+- OpenSearch/Elasticsearch `_count` 与 scroll 查询
+- CSV 流式导出（成功、计数失败、空结果、tenant_id 失败、双引擎参数）
 - Neo4j 导入（关系类型校验、连接测试、节点/边批量导入）
 
 ---

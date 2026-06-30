@@ -1,10 +1,9 @@
-# ragflow_api.py
+# exporter.py
 import json
 import logging
 import math
 import os
 
-import networkx as nx
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -21,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # ------------------------------------------
 
-# OpenSearch 直连导出时，节点与边仅保留 content_with_weight 中的字段
+# 流式导出时，节点与边仅保留 content_with_weight 中的字段
 _DIRECT_NODE_COLUMNS = ["id", "entity_type", "description", "source_id", "pagerank", "rank"]
 _DIRECT_EDGE_COLUMNS = ["source", "target", "description", "keywords", "weight", "source_id"]
 
@@ -43,6 +42,17 @@ def _read_opensearch_config():
         "user": config.OPENSEARCH_USER,
         "password": config.OPENSEARCH_PASSWORD,
         "use_ssl": config.OPENSEARCH_USE_SSL,
+    }
+
+
+def _read_elasticsearch_config():
+    """统一从 config 读取 Elasticsearch 直连配置。"""
+    return {
+        "host": config.ELASTICSEARCH_HOST,
+        "port": config.ELASTICSEARCH_PORT,
+        "user": config.ELASTICSEARCH_USER,
+        "password": config.ELASTICSEARCH_PASSWORD,
+        "use_ssl": config.ELASTICSEARCH_USE_SSL,
     }
 
 
@@ -75,24 +85,6 @@ def _safe_serialize(value):
     return str(value)
 
 
-def sanitize_attrs(G):
-    """递归处理图中所有节点和边的属性，将非标量值转换为 JSON 字符串，
-    并处理 None 和 NaN，确保 CSV 导出时的兼容性。
-    """
-    for node, attrs in list(G.nodes(data=True)):
-        for key, value in list(attrs.items()):
-            attrs[key] = _escape_csv_injection(_safe_serialize(value))
-
-    for u, v, attrs in list(G.edges(data=True)):
-        for key, value in list(attrs.items()):
-            attrs[key] = _escape_csv_injection(_safe_serialize(value))
-
-    for key, value in list(G.graph.items()):
-        G.graph[key] = _escape_csv_injection(_safe_serialize(value))
-
-    return G
-
-
 def _get_session():
     """创建带重试机制的 requests Session"""
     session = requests.Session()
@@ -108,7 +100,10 @@ def _get_session():
 
 
 def _get_tenant_id():
-    """通过 RAGFlow Dataset API 获取 tenant_id。"""
+    """通过 RAGFlow Dataset API 获取 tenant_id。
+
+    tenant_id 用于构造搜索引擎索引名 ragflow_{tenant_id}。
+    """
     dataset_url = f"{RAGFLOW_BASE_URL}/api/v1/datasets/{KB_ID}"
     headers = {
         "Authorization": f"Bearer {RAGFLOW_API_KEY}",
@@ -140,61 +135,32 @@ def _get_tenant_id():
 
     tenant_id = dataset_result.get("data", {}).get("tenant_id")
     if not tenant_id:
-        logger.error("Dataset 响应中缺少 tenant_id，无法确定 OpenSearch 索引名。")
+        logger.error("Dataset 响应中缺少 tenant_id，无法确定搜索引擎索引名。")
         return None
 
     return tenant_id
 
 
-def fetch_knowledge_graph():
-    """调用 RAGFlow API 获取知识图谱数据"""
-    url = f"{RAGFLOW_BASE_URL}/api/v1/datasets/{KB_ID}/graph/export"
-    headers = {
-        "Authorization": f"Bearer {RAGFLOW_API_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": "RagFlow2neo4j/1.0 (https://github.com/RagFlow2neo4j)"
-    }
+def _count_es_docs(count_url, query, auth):
+    """使用搜索引擎的 _count API 获取符合条件的文档总数。
 
-    logger.info("正在请求: %s", url)
-    logger.info("请求超时设置: %s 秒", RAGFLOW_REQUEST_TIMEOUT)
-    try:
-        session = _get_session()
-        response = session.get(url, headers=headers, timeout=RAGFLOW_REQUEST_TIMEOUT)
-    except requests.exceptions.RequestException as exc:
-        logger.error("请求异常: %s", exc)
-        return None
-
-    if response.status_code != 200:
-        logger.error("请求失败: HTTP %s, 响应内容: %s", response.status_code, response.text)
-        return None
-
-    try:
-        result = response.json()
-    except json.JSONDecodeError as exc:
-        logger.error("响应 JSON 解析失败: %s", exc)
-        return None
-
-    if result.get("code") != 0:
-        logger.error("API 返回错误: %s", result.get("message"))
-        return None
-
-    return result.get("data")
-
-
-def _count_os_docs(count_url, query, auth):
-    """使用 OpenSearch _count API 获取符合条件的文档总数。"""
+    OpenSearch 与 Elasticsearch 的 _count 接口兼容，因此本函数通用。
+    """
     try:
         resp = requests.post(count_url, json=query, auth=auth, timeout=30)
         resp.raise_for_status()
         result = resp.json()
         return result.get("count", 0)
     except Exception as exc:
-        logger.error("OpenSearch 计数请求异常: %s", exc)
+        logger.error("搜索引擎计数请求异常: %s", exc)
         return None
 
 
-def _scroll_search_batches(search_url, query, auth, scheme, os_host, os_port, batch_size=1000):
-    """使用 OpenSearch scroll API 逐批次 yield hits 列表。"""
+def _scroll_search_batches(search_url, query, auth, scheme, host, port, batch_size=1000):
+    """使用搜索引擎 scroll API 逐批次 yield hits 列表。
+
+    OpenSearch 与 Elasticsearch 的 scroll 接口兼容，因此本函数通用。
+    """
     scroll_id = None
     scroll_search_url = f"{search_url}?scroll=2m"
 
@@ -214,7 +180,7 @@ def _scroll_search_batches(search_url, query, auth, scheme, os_host, os_port, ba
 
         while len(hits) > 0:
             scroll_resp = requests.post(
-                f"{scheme}://{os_host}:{os_port}/_search/scroll",
+                f"{scheme}://{host}:{port}/_search/scroll",
                 json={"scroll": "2m", "scroll_id": scroll_id},
                 auth=auth,
                 timeout=60,
@@ -229,7 +195,7 @@ def _scroll_search_batches(search_url, query, auth, scheme, os_host, os_port, ba
         if scroll_id:
             try:
                 requests.delete(
-                    f"{scheme}://{os_host}:{os_port}/_search/scroll",
+                    f"{scheme}://{host}:{port}/_search/scroll",
                     json={"scroll_id": [scroll_id]},
                     auth=auth,
                     timeout=30,
@@ -238,158 +204,46 @@ def _scroll_search_batches(search_url, query, auth, scheme, os_host, os_port, ba
                 pass
 
 
-def fetch_knowledge_graph_direct():
-    """绕过 RAGFlow /graph/export API，直接从 OpenSearch 读取实体和关系文档构建知识图谱。
+def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_size=1000, engine="opensearch"):
+    """绕过 /graph/export API，直接从搜索引擎流式读取并导出 CSV。
 
-    适用场景：RAGFlow 因数据量过大导致导出接口异常时。
-
-    实现原理：RAGFlow 将最终知识图谱以独立文档形式存入 OpenSearch：
-      - 实体文档：knowledge_graph_kwd="entity"
-      - 关系文档：knowledge_graph_kwd="relation"
-    本方法分别读取这两类文档，解析后构建 NetworkX 图对象。
-
-    返回格式与 fetch_knowledge_graph() 保持一致：{"graph": <dict>}。
-    """
-    tenant_id = _get_tenant_id()
-    if not tenant_id:
-        return None
-
-    os_cfg = _read_opensearch_config()
-    os_host = os_cfg["host"]
-    os_port = os_cfg["port"]
-    os_user = os_cfg["user"]
-    os_pass = os_cfg["password"]
-    scheme = "https" if os_cfg["use_ssl"] else "http"
-
-    index_name = f"ragflow_{tenant_id}"
-    search_url = f"{scheme}://{os_host}:{os_port}/{index_name}/_search"
-    auth = (os_user, os_pass) if os_user else None
-
-    entity_query = {
-        "query": {
-            "bool": {
-                "filter": [
-                    {"term": {"kb_id": KB_ID}},
-                    {"term": {"knowledge_graph_kwd": "entity"}},
-                ]
-            }
-        }
-    }
-    relation_query = {
-        "query": {
-            "bool": {
-                "filter": [
-                    {"term": {"kb_id": KB_ID}},
-                    {"term": {"knowledge_graph_kwd": "relation"}},
-                ]
-            }
-        }
-    }
-
-    logger.info("正在从 OpenSearch 读取实体文档...")
-    entity_hits = list(_scroll_search_batches(search_url, entity_query, auth, scheme, os_host, os_port))
-    entity_hits = [hit for batch in entity_hits for hit in batch]
-    logger.info("共读取 %s 个实体文档", len(entity_hits))
-
-    logger.info("正在从 OpenSearch 读取关系文档...")
-    relation_hits = list(_scroll_search_batches(search_url, relation_query, auth, scheme, os_host, os_port))
-    relation_hits = [hit for batch in relation_hits for hit in batch]
-    logger.info("共读取 %s 个关系文档", len(relation_hits))
-
-    if not entity_hits and not relation_hits:
-        logger.error("该知识库在 OpenSearch 中没有任何实体或关系文档，无法构建图谱。")
-        return None
-
-    G = nx.Graph()
-    G.graph["created_by"] = "RagFlow2neo4j_direct"
-
-    node_count = 0
-    for hit in entity_hits:
-        source = hit.get("_source", {})
-        content = {}
-        try:
-            content = json.loads(source.get("content_with_weight", "{}"))
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        entity_name = content.get("entity_name")
-        if not entity_name:
-            continue
-
-        attrs = {
-            "entity_type": content.get("entity_type", ""),
-            "description": content.get("description", ""),
-            "source_id": content.get("source_id", []),
-            "pagerank": content.get("pagerank", ""),
-            "rank": content.get("rank", ""),
-        }
-
-        G.add_node(entity_name, **attrs)
-        node_count += 1
-
-    edge_count = 0
-    for hit in relation_hits:
-        source = hit.get("_source", {})
-        content = {}
-        try:
-            content = json.loads(source.get("content_with_weight", "{}"))
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        from_entity = content.get("src_id")
-        to_entity = content.get("tgt_id")
-        if not from_entity or not to_entity:
-            continue
-
-        attrs = {
-            "description": content.get("description", ""),
-            "keywords": content.get("keywords", []),
-            "weight": content.get("weight", ""),
-            "source_id": content.get("source_id", []),
-        }
-
-        G.add_edge(from_entity, to_entity, **attrs)
-        edge_count += 1
-
-    graph_data = nx.node_link_data(G, edges="edges")
-    logger.info(
-        "成功从 OpenSearch 构建知识图谱: %s 个节点, %s 条边",
-        node_count, edge_count,
-    )
-
-    return {"graph": graph_data}
-
-
-def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_size=1000):
-    """绕过 API，直接从 OpenSearch 流式读取并导出 CSV。
+    参数:
+        engine: "opensearch" 或 "elasticsearch"，决定读取哪个配置。
 
     流程：
-      1. 先通过 _count API 统计实体总数和关系总数；
-      2. 分两个阶段 scroll 拉取：
+      1. 通过 RAGFlow Dataset API 获取 tenant_id；
+      2. 使用搜索引擎 _count API 统计实体总数和关系总数；
+      3. 分两个阶段 scroll 拉取：
          - 阶段一：读取实体文档，逐批追加写入 nodes.csv；
-         - 阶段二：读取关系文档，逐批追加写入 edges.csv；
-      3. 若关系引用了尚未写入的节点，自动在 nodes.csv 中补录空节点。
+         - 阶段二：读取关系文档，逐批追加写入 edges.csv。
     每批次均打印分数形式的进度日志（当前/总数）。
     """
+    if engine not in ("opensearch", "elasticsearch"):
+        logger.error("不支持的搜索引擎类型: %s，仅支持 opensearch 或 elasticsearch", engine)
+        return False
+
     kb_id = kb_id or KB_ID
     output_dir = output_dir or OUTPUT_DIR or os.path.dirname(output_prefix or OUTPUT_PREFIX)
     base_name = os.path.basename(output_prefix or OUTPUT_PREFIX) or "output"
+
+    engine_label = "OpenSearch" if engine == "opensearch" else "Elasticsearch"
+    read_config_fn = _read_opensearch_config if engine == "opensearch" else _read_elasticsearch_config
 
     tenant_id = _get_tenant_id()
     if not tenant_id:
         return False
 
-    os_cfg = _read_opensearch_config()
-    os_host = os_cfg["host"]
-    os_port = os_cfg["port"]
-    os_user = os_cfg["user"]
-    os_pass = os_cfg["password"]
-    scheme = "https" if os_cfg["use_ssl"] else "http"
+    search_cfg = read_config_fn()
+    host = search_cfg["host"]
+    port = search_cfg["port"]
+    user = search_cfg["user"]
+    password = search_cfg["password"]
+    scheme = "https" if search_cfg["use_ssl"] else "http"
 
     index_name = f"ragflow_{tenant_id}"
-    search_url = f"{scheme}://{os_host}:{os_port}/{index_name}/_search"
-    count_url = f"{scheme}://{os_host}:{os_port}/{index_name}/_count"
-    auth = (os_user, os_pass) if os_user else None
+    search_url = f"{scheme}://{host}:{port}/{index_name}/_search"
+    count_url = f"{scheme}://{host}:{port}/{index_name}/_count"
+    auth = (user, password) if user else None
 
     entity_query = {
         "query": {
@@ -413,17 +267,17 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
     }
 
     # ---- 先统计数量 ----
-    logger.info("正在统计 OpenSearch 中实体与关系文档数量...")
-    entity_total = _count_os_docs(count_url, entity_query, auth)
-    relation_total = _count_os_docs(count_url, relation_query, auth)
+    logger.info("正在统计 %s 中实体与关系文档数量...", engine_label)
+    entity_total = _count_es_docs(count_url, entity_query, auth)
+    relation_total = _count_es_docs(count_url, relation_query, auth)
     if entity_total is None or relation_total is None:
         logger.error("统计文档数量失败，导出终止。")
         return False
 
-    logger.info("OpenSearch 统计结果: 实体 %s 个, 关系 %s 个", entity_total, relation_total)
+    logger.info("%s 统计结果: 实体 %s 个, 关系 %s 个", engine_label, entity_total, relation_total)
 
     if entity_total == 0 and relation_total == 0:
-        logger.error("该知识库在 OpenSearch 中没有任何实体或关系文档，导出终止。")
+        logger.error("该知识库在 %s 中没有任何实体或关系文档，导出终止。", engine_label)
         return False
 
     # ---- 准备 CSV 路径 ----
@@ -445,7 +299,7 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
     total_nodes_written = 0
     batch_idx = 0
 
-    for batch in _scroll_search_batches(search_url, entity_query, auth, scheme, os_host, os_port, batch_size):
+    for batch in _scroll_search_batches(search_url, entity_query, auth, scheme, host, port, batch_size):
         batch_idx += 1
         rows = []
         for hit in batch:
@@ -495,7 +349,7 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
     total_edges_written = 0
     batch_idx = 0
 
-    for batch in _scroll_search_batches(search_url, relation_query, auth, scheme, os_host, os_port, batch_size):
+    for batch in _scroll_search_batches(search_url, relation_query, auth, scheme, host, port, batch_size):
         batch_idx += 1
         rows = []
         for hit in batch:
@@ -542,7 +396,8 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
             )
 
     logger.info(
-        "流式导出完成: 节点 %s 个，关系 %s 条。CSV: %s, %s",
+        "%s 流式导出完成: 节点 %s 个，关系 %s 条。CSV: %s, %s",
+        engine_label,
         total_nodes_written,
         total_edges_written,
         nodes_csv,
@@ -551,63 +406,12 @@ def export_graph_direct(kb_id=None, output_dir=None, output_prefix=None, batch_s
     return True
 
 
-def export_graph(data):
-    """将 API 数据转为图对象并导出 CSV 文件（节点和边）"""
-    if not isinstance(data, dict):
-        logger.error("API 数据格式异常，期望 dict，实际为 %s", type(data).__name__)
-        return
-
-    graph_info = data.get("graph")
-    if not isinstance(graph_info, dict):
-        logger.error("API 数据中缺少 graph 字段或格式异常")
-        return
-
-    nodes = graph_info.get("nodes", [])
-    edges = graph_info.get("edges", [])
-    logger.info("成功获取图谱: %s 个节点, %s 条边", len(nodes), len(edges))
-
-    # 构建 NetworkX 图（使用 edges="edges" 以兼容 NetworkX 3.x+ 的默认行为）
-    try:
-        G = nx.node_link_graph(graph_info, edges="edges")
-    except Exception as exc:
-        logger.error("NetworkX 建图失败: %s", exc)
-        return
-
-    # 清洗属性以保证 CSV 兼容
-    G = sanitize_attrs(G)
-
-    # 构建 CSV 路径（含 KB_ID，用于区分不同知识库）
-    output_dir = OUTPUT_DIR or os.path.dirname(OUTPUT_PREFIX)
-    base_name = os.path.basename(OUTPUT_PREFIX) or "output"
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    nodes_csv = os.path.join(output_dir, f"{base_name}_{KB_ID}_nodes.csv")
-    edges_csv = os.path.join(output_dir, f"{base_name}_{KB_ID}_edges.csv")
-
-    # 导出节点 CSV（第一列为 id，带列名）
-    nodes_data = dict(G.nodes(data=True))
-    if nodes_data:
-        nodes_df = pd.DataFrame.from_dict(nodes_data, orient="index")
-    else:
-        nodes_df = pd.DataFrame()
-    nodes_df.to_csv(
-        nodes_csv,
-        encoding="utf-8-sig",
-        index_label="id"
-    )
-
-    # 导出边 CSV
-    if G.number_of_edges() > 0:
-        edges_df = nx.to_pandas_edgelist(G)
-    else:
-        edges_df = pd.DataFrame()
-    edges_df.to_csv(
-        edges_csv,
-        index=False,
-        encoding="utf-8-sig"
-    )
-
-    logger.info(
-        "已导出节点和边的 CSV 文件: %s, %s",
-        nodes_csv, edges_csv
+def export_graph_direct_elasticsearch(kb_id=None, output_dir=None, output_prefix=None, batch_size=1000):
+    """从 Elasticsearch 流式导出 CSV 的便捷函数。"""
+    return export_graph_direct(
+        kb_id=kb_id,
+        output_dir=output_dir,
+        output_prefix=output_prefix,
+        batch_size=batch_size,
+        engine="elasticsearch",
     )

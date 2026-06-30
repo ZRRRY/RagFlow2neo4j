@@ -19,12 +19,15 @@ mock_config.OPENSEARCH_PORT = 9201
 mock_config.OPENSEARCH_USER = "admin"
 mock_config.OPENSEARCH_PASSWORD = "test"
 mock_config.OPENSEARCH_USE_SSL = False
+mock_config.ELASTICSEARCH_HOST = "localhost"
+mock_config.ELASTICSEARCH_PORT = 9200
+mock_config.ELASTICSEARCH_USER = ""
+mock_config.ELASTICSEARCH_PASSWORD = ""
+mock_config.ELASTICSEARCH_USE_SSL = False
 sys.modules["config"] = mock_config
 
 import json
-import math
 
-import networkx as nx
 import pandas as pd
 import pytest
 import requests
@@ -33,251 +36,56 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import exporter
 
 
-class TestSanitizeAttrs:
+class TestSafeSerialize:
     def test_none_becomes_empty_string(self):
-        G = nx.Graph()
-        G.add_node("a", foo=None)
-        exporter.sanitize_attrs(G)
-        assert G.nodes["a"]["foo"] == ""
+        assert exporter._safe_serialize(None) == ""
 
     def test_nan_and_inf_become_empty_string(self):
-        G = nx.Graph()
-        G.add_node("a", x=float("nan"), y=float("inf"), z=float("-inf"))
-        exporter.sanitize_attrs(G)
-        assert G.nodes["a"]["x"] == ""
-        assert G.nodes["a"]["y"] == ""
-        assert G.nodes["a"]["z"] == ""
+        assert exporter._safe_serialize(float("nan")) == ""
+        assert exporter._safe_serialize(float("inf")) == ""
+        assert exporter._safe_serialize(float("-inf")) == ""
 
     def test_scalar_types_unchanged(self):
-        G = nx.Graph()
-        G.add_node("a", s="hello", i=42, b=True)
-        exporter.sanitize_attrs(G)
-        assert G.nodes["a"]["s"] == "hello"
-        assert G.nodes["a"]["i"] == 42
-        assert G.nodes["a"]["b"] is True
+        assert exporter._safe_serialize("hello") == "hello"
+        assert exporter._safe_serialize(42) == 42
+        assert exporter._safe_serialize(True) is True
 
     def test_list_and_dict_become_json(self):
-        G = nx.Graph()
-        G.add_node("a", lst=[1, 2, 3], dct={"k": "v"})
-        exporter.sanitize_attrs(G)
-        assert json.loads(G.nodes["a"]["lst"]) == [1, 2, 3]
-        assert json.loads(G.nodes["a"]["dct"]) == {"k": "v"}
-
-    def test_edge_attrs_are_sanitized(self):
-        G = nx.Graph()
-        G.add_edge("a", "b", weight=1.5, tag=None)
-        exporter.sanitize_attrs(G)
-        assert G.edges["a", "b"]["weight"] == 1.5
-        assert G.edges["a", "b"]["tag"] == ""
-
-    def test_csv_injection_escaped(self):
-        G = nx.Graph()
-        G.add_node("a", formula="=SUM(A1:A10)", plus="+1", minus="-1", at="@test")
-        exporter.sanitize_attrs(G)
-        assert G.nodes["a"]["formula"] == "'=SUM(A1:A10)"
-        assert G.nodes["a"]["plus"] == "'+1"
-        assert G.nodes["a"]["minus"] == "'-1"
-        assert G.nodes["a"]["at"] == "'@test"
+        assert json.loads(exporter._safe_serialize([1, 2, 3])) == [1, 2, 3]
+        assert json.loads(exporter._safe_serialize({"k": "v"})) == {"k": "v"}
 
 
-class TestFetchKnowledgeGraph:
-    def _mock_session(self, status_code=200, text="", json=None, side_effect=None):
-        mock_resp = mock.Mock()
-        mock_resp.status_code = status_code
-        mock_resp.text = text
-        if json is not None:
-            mock_resp.json = json
-        mock_session = mock.Mock()
-        mock_session.get = mock.Mock(return_value=mock_resp, side_effect=side_effect)
-        return mock_session
+class TestEscapeCsvInjection:
+    def test_escape_dangerous_prefixes(self):
+        assert exporter._escape_csv_injection("=SUM(A1:A10)") == "'=SUM(A1:A10)"
+        assert exporter._escape_csv_injection("+1") == "'+1"
+        assert exporter._escape_csv_injection("-1") == "'-1"
+        assert exporter._escape_csv_injection("@test") == "'@test"
 
-    @mock.patch("exporter._get_session")
-    def test_success(self, mock_get_session):
-        mock_get_session.return_value = self._mock_session(
+    def test_normal_strings_unchanged(self):
+        assert exporter._escape_csv_injection("hello") == "hello"
+        assert exporter._escape_csv_injection(123) == 123
+
+
+class TestCountEsDocs:
+    @mock.patch("exporter.requests.post")
+    def test_success(self, mock_post):
+        mock_post.return_value = mock.Mock(
             status_code=200,
-            text='{"code":0,"data":{"graph":{"nodes":[],"edges":[]}}}',
-            json=lambda: {"code": 0, "data": {"graph": {"nodes": [], "edges": []}}},
+            json=mock.Mock(return_value={"count": 42}),
+            raise_for_status=mock.Mock(),
         )
-        result = exporter.fetch_knowledge_graph()
-        assert result == {"graph": {"nodes": [], "edges": []}}
-        mock_get_session.return_value.get.assert_called_once()
+        result = exporter._count_es_docs("http://es:9200/i/_count", {"query": {"match_all": {}}}, None)
+        assert result == 42
 
-    @mock.patch("exporter._get_session")
-    def test_http_error(self, mock_get_session):
-        mock_get_session.return_value = self._mock_session(
-            status_code=500, text="Internal Server Error"
-        )
-        result = exporter.fetch_knowledge_graph()
-        assert result is None
-
-    @mock.patch("exporter._get_session")
-    def test_api_error_code(self, mock_get_session):
-        mock_get_session.return_value = self._mock_session(
-            status_code=200,
-            text='{"code":-1,"message":"auth failed"}',
-            json=lambda: {"code": -1, "message": "auth failed"},
-        )
-        result = exporter.fetch_knowledge_graph()
-        assert result is None
-
-    @mock.patch("exporter._get_session")
-    def test_json_decode_error(self, mock_get_session):
-        mock_get_session.return_value = self._mock_session(
-            status_code=200,
-            text="not json",
-            json=lambda: json.loads("not json"),
-        )
-        result = exporter.fetch_knowledge_graph()
-        assert result is None
-
-    @mock.patch("exporter._get_session")
-    def test_request_exception(self, mock_get_session):
-        mock_get_session.return_value = self._mock_session(
-            side_effect=requests.exceptions.ConnectionError("Connection refused")
-        )
-        result = exporter.fetch_knowledge_graph()
+    @mock.patch("exporter.requests.post")
+    def test_exception(self, mock_post):
+        mock_post.side_effect = requests.exceptions.ConnectionError("refused")
+        result = exporter._count_es_docs("http://es:9200/i/_count", {"query": {"match_all": {}}}, None)
         assert result is None
 
 
-class TestFetchKnowledgeGraphDirect:
-    def _mock_dataset_resp(self, tenant_id="test-tenant", code=0, message="", status_code=200, side_effect=None):
-        """构造 RAGFlow Dataset API 的 mock 响应"""
-        mock_resp = mock.Mock()
-        mock_resp.status_code = status_code
-        mock_resp.text = ""
-        if side_effect:
-            mock_resp.json = mock.Mock(side_effect=side_effect)
-        else:
-            mock_resp.json = mock.Mock(return_value={
-                "code": code,
-                "message": message,
-                "data": {"tenant_id": tenant_id} if tenant_id else {}
-            })
-        mock_session = mock.Mock()
-        mock_session.get = mock.Mock(return_value=mock_resp, side_effect=side_effect)
-        return mock_session
-
-    def _entity_hit(self, entity_name, entity_type="", description="", source_id=None, pagerank="", rank="", doc_id=""):
-        content = {
-            "entity_name": entity_name,
-            "entity_type": entity_type,
-            "description": description,
-            "source_id": source_id or [],
-            "pagerank": pagerank,
-            "rank": rank,
-        }
-        return {
-            "_source": {
-                "content_with_weight": json.dumps(content),
-                "id": doc_id,
-            }
-        }
-
-    def _relation_hit(self, src_id, tgt_id, description="", keywords=None, weight="", source_id=None, doc_id=""):
-        content = {
-            "src_id": src_id,
-            "tgt_id": tgt_id,
-            "description": description,
-            "keywords": keywords or [],
-            "weight": weight,
-            "source_id": source_id or [],
-        }
-        return {
-            "_source": {
-                "content_with_weight": json.dumps(content),
-                "id": doc_id,
-            }
-        }
-
-    @mock.patch("exporter._scroll_search_batches")
-    @mock.patch("exporter._get_session")
-    def test_success(self, mock_get_session, mock_scroll):
-        mock_get_session.return_value = self._mock_dataset_resp(tenant_id="t-123")
-
-        def scroll_side_effect(search_url, query, auth, scheme, host, port, batch_size=1000):
-            kg_kwd = query["query"]["bool"]["filter"][1]["term"]["knowledge_graph_kwd"]
-            if kg_kwd == "entity":
-                return [
-                    [
-                        self._entity_hit("ENTITY_A", "PERSON", "desc A", ["doc1"], 0.001, 3, "e1"),
-                        self._entity_hit("ENTITY_B", "COMPANY", "desc B", ["doc2"], 0.002, 2, "e2"),
-                    ]
-                ]
-            else:
-                return [
-                    [
-                        self._relation_hit("ENTITY_A", "ENTITY_B", "rel desc", ["k1"], 1.5, ["doc1"], "r1"),
-                    ]
-                ]
-
-        mock_scroll.side_effect = scroll_side_effect
-        result = exporter.fetch_knowledge_graph_direct()
-        assert result is not None
-        graph = result["graph"]
-        node_ids = {n["id"] for n in graph["nodes"]}
-        assert node_ids == {"ENTITY_A", "ENTITY_B"}
-        assert len(graph["edges"]) == 1
-        assert graph["edges"][0]["source"] == "ENTITY_A"
-        assert graph["edges"][0]["target"] == "ENTITY_B"
-        assert graph["edges"][0]["weight"] == 1.5
-
-    @mock.patch("exporter._scroll_search_batches")
-    @mock.patch("exporter._get_session")
-    def test_dataset_http_error(self, mock_get_session, mock_scroll):
-        mock_get_session.return_value = self._mock_dataset_resp(status_code=500)
-        result = exporter.fetch_knowledge_graph_direct()
-        assert result is None
-        mock_scroll.assert_not_called()
-
-    @mock.patch("exporter._scroll_search_batches")
-    @mock.patch("exporter._get_session")
-    def test_dataset_api_error_code(self, mock_get_session, mock_scroll):
-        mock_get_session.return_value = self._mock_dataset_resp(code=102, message="error")
-        result = exporter.fetch_knowledge_graph_direct()
-        assert result is None
-        mock_scroll.assert_not_called()
-
-    @mock.patch("exporter._scroll_search_batches")
-    @mock.patch("exporter._get_session")
-    def test_opensearch_empty_results(self, mock_get_session, mock_scroll):
-        mock_get_session.return_value = self._mock_dataset_resp(tenant_id="t-123")
-        mock_scroll.return_value = []
-        result = exporter.fetch_knowledge_graph_direct()
-        assert result is None
-
-    @mock.patch("exporter._scroll_search_batches")
-    @mock.patch("exporter._get_session")
-    def test_skip_invalid_records(self, mock_get_session, mock_scroll):
-        """content_with_weight 解析失败或缺少关键字段时应跳过，不影响其他记录"""
-        mock_get_session.return_value = self._mock_dataset_resp(tenant_id="t-123")
-
-        def scroll_side_effect(search_url, query, auth, scheme, host, port, batch_size=1000):
-            kg_kwd = query["query"]["bool"]["filter"][1]["term"]["knowledge_graph_kwd"]
-            if kg_kwd == "entity":
-                return [
-                    [
-                        {"_source": {"entity_kwd": "VALID_ENTITY", "content_with_weight": "bad json"}},
-                        self._entity_hit("GOOD_ENTITY", "TYPE", "ok", [], 0.0, 0, "e2"),
-                    ]
-                ]
-            else:
-                return [
-                    [
-                        {"_source": {"from_entity_kwd": "", "to_entity_kwd": "GOOD_ENTITY", "content_with_weight": "{}"}},
-                        self._relation_hit("VALID_ENTITY", "GOOD_ENTITY", "", [], 2.0, [], "r1"),
-                    ]
-                ]
-
-        mock_scroll.side_effect = scroll_side_effect
-        result = exporter.fetch_knowledge_graph_direct()
-        assert result is not None
-        graph = result["graph"]
-        node_ids = {n["id"] for n in graph["nodes"]}
-        assert node_ids == {"VALID_ENTITY", "GOOD_ENTITY"}
-        assert len(graph["edges"]) == 1
-        edge_endpoints = {graph["edges"][0]["source"], graph["edges"][0]["target"]}
-        assert edge_endpoints == {"VALID_ENTITY", "GOOD_ENTITY"}
-
+class TestScrollSearchBatches:
     @mock.patch("exporter.requests.delete")
     @mock.patch("exporter.requests.post")
     def test_scroll_search_batches(self, mock_post, mock_delete):
@@ -310,7 +118,7 @@ class TestFetchKnowledgeGraphDirect:
         batches = list(_scroll_search_batches(
             "http://localhost:9200/index/_search",
             {"query": {"match_all": {}}},
-            ("admin", "pass"),
+            None,
             "http",
             "localhost",
             9200,
@@ -322,31 +130,14 @@ class TestFetchKnowledgeGraphDirect:
         mock_delete.assert_called_once()
 
 
-class TestCountOsDocs:
-    @mock.patch("exporter.requests.post")
-    def test_success(self, mock_post):
-        mock_post.return_value = mock.Mock(
-            status_code=200,
-            json=mock.Mock(return_value={"count": 42}),
-            raise_for_status=mock.Mock(),
-        )
-        result = exporter._count_os_docs("http://os:9200/i/_count", {"query": {"match_all": {}}}, None)
-        assert result == 42
-
-    @mock.patch("exporter.requests.post")
-    def test_exception(self, mock_post):
-        mock_post.side_effect = requests.exceptions.ConnectionError("refused")
-        result = exporter._count_os_docs("http://os:9200/i/_count", {"query": {"match_all": {}}}, None)
-        assert result is None
-
-
 class TestExportGraphDirect:
+    """测试 OpenSearch 与 Elasticsearch 的流式导出。"""
+
     def _csv_paths(self, prefix, kb_id="test_kb"):
         return f"{prefix}_{kb_id}_nodes.csv", f"{prefix}_{kb_id}_edges.csv"
 
     def _make_scroll_mock(self, entity_batches, relation_batches):
         """构造 _scroll_search_batches 的 side_effect"""
-        calls = []
         def side_effect(search_url, query, auth, scheme, host, port, batch_size=1000):
             kg_kwd = query["query"]["bool"]["filter"][1]["term"]["knowledge_graph_kwd"]
             if kg_kwd == "entity":
@@ -355,10 +146,11 @@ class TestExportGraphDirect:
                 return relation_batches
         return side_effect
 
+    @pytest.mark.parametrize("engine", ["opensearch", "elasticsearch"])
     @mock.patch("exporter._scroll_search_batches")
-    @mock.patch("exporter._count_os_docs")
+    @mock.patch("exporter._count_es_docs")
     @mock.patch("exporter._get_tenant_id")
-    def test_success(self, mock_tenant, mock_count, mock_scroll, tmp_path):
+    def test_success(self, mock_tenant, mock_count, mock_scroll, engine, tmp_path):
         mock_tenant.return_value = "t-123"
         mock_count.side_effect = lambda count_url, query, auth: (
             2 if query["query"]["bool"]["filter"][1]["term"]["knowledge_graph_kwd"] == "entity" else 1
@@ -377,11 +169,11 @@ class TestExportGraphDirect:
             ],
         )
 
-        prefix = str(tmp_path / "direct")
+        prefix = str(tmp_path / engine)
         old_prefix = exporter.OUTPUT_PREFIX
         exporter.OUTPUT_PREFIX = prefix
         try:
-            result = exporter.export_graph_direct(kb_id="test_kb", output_prefix=prefix)
+            result = exporter.export_graph_direct(kb_id="test_kb", output_prefix=prefix, engine=engine)
             assert result is True
             nodes_file, edges_file = self._csv_paths(prefix)
             assert os.path.exists(nodes_file)
@@ -396,7 +188,7 @@ class TestExportGraphDirect:
         finally:
             exporter.OUTPUT_PREFIX = old_prefix
 
-    @mock.patch("exporter._count_os_docs")
+    @mock.patch("exporter._count_es_docs")
     @mock.patch("exporter._get_tenant_id")
     def test_count_failure(self, mock_tenant, mock_count, tmp_path):
         mock_tenant.return_value = "t-123"
@@ -404,7 +196,7 @@ class TestExportGraphDirect:
         result = exporter.export_graph_direct(kb_id="test_kb")
         assert result is False
 
-    @mock.patch("exporter._count_os_docs")
+    @mock.patch("exporter._count_es_docs")
     @mock.patch("exporter._get_tenant_id")
     def test_empty_results(self, mock_tenant, mock_count, tmp_path):
         mock_tenant.return_value = "t-123"
@@ -412,59 +204,27 @@ class TestExportGraphDirect:
         result = exporter.export_graph_direct(kb_id="test_kb")
         assert result is False
 
-class TestExportGraph:
-    def _csv_paths(self, prefix):
-        # export_graph 现在生成 {prefix}_{KB_ID}_nodes.csv
-        return f"{prefix}_test_kb_id_nodes.csv", f"{prefix}_test_kb_id_edges.csv"
+    @mock.patch("exporter._get_tenant_id")
+    def test_tenant_failure(self, mock_tenant, tmp_path):
+        mock_tenant.return_value = None
+        result = exporter.export_graph_direct(kb_id="test_kb")
+        assert result is False
 
-    def test_export_empty_graph(self, tmp_path):
-        prefix = str(tmp_path / "empty")
-        old_prefix = exporter.OUTPUT_PREFIX
-        exporter.OUTPUT_PREFIX = prefix
-        try:
-            exporter.export_graph({"graph": {"nodes": [], "edges": []}})
-            nodes_file, edges_file = self._csv_paths(prefix)
-            assert os.path.exists(nodes_file)
-            assert os.path.exists(edges_file)
-            pd.read_csv(nodes_file)
-        finally:
-            exporter.OUTPUT_PREFIX = old_prefix
+    @mock.patch("exporter.export_graph_direct")
+    def test_elasticsearch_alias(self, mock_export):
+        mock_export.return_value = True
+        result = exporter.export_graph_direct_elasticsearch(kb_id="alias_kb", output_prefix="/tmp/alias")
+        assert result is True
+        mock_export.assert_called_once_with(
+            kb_id="alias_kb",
+            output_dir=None,
+            output_prefix="/tmp/alias",
+            batch_size=1000,
+            engine="elasticsearch",
+        )
 
-    def test_export_with_data(self, tmp_path):
-        prefix = str(tmp_path / "graph")
-        old_prefix = exporter.OUTPUT_PREFIX
-        exporter.OUTPUT_PREFIX = prefix
-        try:
-            data = {
-                "graph": {
-                    "directed": False,
-                    "multigraph": False,
-                    "graph": {},
-                    "nodes": [
-                        {"id": "n1", "label": "Person"},
-                        {"id": "n2", "label": "Company"},
-                    ],
-                    "edges": [
-                        {"source": "n1", "target": "n2", "relation": "works_for"}
-                    ],
-                }
-            }
-            exporter.export_graph(data)
-            nodes_file, edges_file = self._csv_paths(prefix)
-            nodes_df = pd.read_csv(nodes_file)
-            edges_df = pd.read_csv(edges_file)
-            assert len(nodes_df) == 2
-            assert len(edges_df) == 1
-            assert "works_for" in edges_df["relation"].values
-        finally:
-            exporter.OUTPUT_PREFIX = old_prefix
-
-    def test_invalid_data_type(self):
+    def test_invalid_engine(self):
         with mock.patch("exporter.logger") as mock_logger:
-            exporter.export_graph("bad data")
-            mock_logger.error.assert_called()
-
-    def test_missing_graph_field(self):
-        with mock.patch("exporter.logger") as mock_logger:
-            exporter.export_graph({})
+            result = exporter.export_graph_direct(kb_id="test_kb", engine="solr")
+            assert result is False
             mock_logger.error.assert_called()

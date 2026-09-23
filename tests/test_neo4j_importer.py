@@ -69,7 +69,11 @@ class TestNeo4jWriter:
     @mock.patch("neo4j_importer.GraphDatabase.driver")
     def test_import_nodes(self, mock_driver, tmp_path):
         csv_path = tmp_path / "nodes.csv"
-        df = pd.DataFrame({"id": ["n1", "n2"], "label": ["Person", "Company"]})
+        df = pd.DataFrame({
+            "id": ["n1", "n1", "n2"],
+            "entity_type": ["Person", "Company", "Company"],
+            "label": ["a", "b", "c"],
+        })
         df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
         mock_session = mock.Mock()
@@ -82,7 +86,12 @@ class TestNeo4jWriter:
         writer.import_nodes(str(csv_path))
         assert mock_session.run.call_count == 1
         cypher = mock_session.run.call_args[0][0]
-        assert "MERGE (n:Entity {id: row.id})" in cypher
+        assert "MERGE (n:Entity {id: row.id, entity_type: row.entity_type})" in cypher
+        # 同名不同类型的行应以不同复合键传入
+        rows = mock_session.run.call_args[1]["rows"]
+        keys = [(r["id"], r["entity_type"]) for r in rows]
+        assert keys == [("n1", "Person"), ("n1", "Company"), ("n2", "Company")]
+        assert all("entity_type" not in r["props"] for r in rows)
 
     @mock.patch("neo4j_importer.GraphDatabase.driver")
     def test_import_edges_groups_by_relation(self, mock_driver, tmp_path):

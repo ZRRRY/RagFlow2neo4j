@@ -32,26 +32,24 @@ def menu():
     print("=" * 40)
     print("当前知识库 ID:", config.KB_ID)
     print("-" * 40)
-    print("1. 从 OpenSearch 流式导出 CSV")
-    print("2. 从 Elasticsearch 流式导出 CSV")
-    print("3. 仅从 CSV 导入 Neo4j")
-    print("4. 自动执行导出 + 导入 Neo4j")
-    print("5. 退出")
+    print("1. 从 Elasticsearch 流式导出 CSV")
+    print("2. 仅从 CSV 导入 Neo4j")
+    print("3. 自动执行导出 + 导入 Neo4j")
+    print("4. 退出")
     print("-" * 40)
-    choice = input("请输入选项 [1-5]: ").strip()
+    choice = input("请输入选项 [1-4]: ").strip()
     return choice
 
 
-def action_export_direct(engine):
-    """根据 engine 从 OpenSearch 或 Elasticsearch 流式导出 CSV。"""
-    label = "OpenSearch" if engine == "opensearch" else "Elasticsearch"
-    logger.info("开始从 %s 流式导出 CSV...", label)
-    success = export_graph_direct(engine=engine)
+def action_export_direct():
+    """从 Elasticsearch 流式导出 CSV。"""
+    logger.info("开始从 Elasticsearch 流式导出 CSV...")
+    success = export_graph_direct(engine="elasticsearch")
     if success:
         nodes, edges = _default_csv_paths()
         logger.info("CSV 导出完成: %s, %s", nodes, edges)
     else:
-        logger.error("从 %s 导出失败，导出终止。", label)
+        logger.error("从 Elasticsearch 导出失败，导出终止。")
 
 
 def action_import_only():
@@ -81,11 +79,10 @@ def action_import_only():
     logger.info("Neo4j 导入完成！")
 
 
-def _run_export_import(engine):
-    """搜索引擎流式导出 + 导入执行逻辑"""
-    label = "OpenSearch" if engine == "opensearch" else "Elasticsearch"
-    logger.info("步骤 1/2: 从 %s 流式导出 CSV...", label)
-    success = export_graph_direct(engine=engine)
+def _run_export_import():
+    """Elasticsearch 流式导出 + 导入执行逻辑"""
+    logger.info("步骤 1/2: 从 Elasticsearch 流式导出 CSV...")
+    success = export_graph_direct(engine="elasticsearch")
     if not success:
         logger.error("导出失败，自动流程终止。")
         return
@@ -110,19 +107,8 @@ def _run_export_import(engine):
 
 
 def action_auto():
-    print("-" * 40)
-    print("请选择导出方式：")
-    print("a. 使用 OpenSearch 流式导出")
-    print("b. 使用 Elasticsearch 流式导出")
-    print("-" * 40)
-    sub = input("请输入选项 [a/b]: ").strip().lower()
-
-    if sub == "a":
-        _run_export_import("opensearch")
-    elif sub == "b":
-        _run_export_import("elasticsearch")
-    else:
-        print("无效选项，返回主菜单。")
+    """自动执行导出（固定 Elasticsearch）+ 导入 Neo4j。"""
+    _run_export_import()
 
 
 def main():
@@ -142,14 +128,12 @@ def main():
         try:
             choice = menu()
             if choice == "1":
-                action_export_direct("opensearch")
+                action_export_direct()
             elif choice == "2":
-                action_export_direct("elasticsearch")
-            elif choice == "3":
                 action_import_only()
-            elif choice == "4":
+            elif choice == "3":
                 action_auto()
-            elif choice == "5":
+            elif choice == "4":
                 print("再见！")
                 sys.exit(0)
             else:

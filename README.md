@@ -8,8 +8,8 @@
 
 - **双引擎流式导出**：绕过 RAGFlow `/graph/export` API，直接从底层 **OpenSearch** 或 **Elasticsearch** 读取完整图谱，适合大数据量
 - **CSV 导出**：自动序列化复杂类型、处理空值、转义 CSV 公式注入，生成标准 CSV 文件
-- **批量导入 Neo4j**：支持节点 `MERGE` 去重、按关系类型分组导入、每批 1000 条事务控制
-- **交互式 CLI**：菜单驱动的命令行界面，支持 OpenSearch 导出、Elasticsearch 导出、单独导入、自动全流程
+- **批量导入 Neo4j**：节点按 `(id, entity_type)` 复合键 `MERGE` 去重、按关系类型分组导入、每批 1000 条事务控制
+- **交互式 CLI**：菜单驱动的命令行界面，支持 Elasticsearch 导出、单独导入、自动全流程
 - **安全**：配置文件使用 Python 格式，真实配置被 `.gitignore` 隔离，避免敏感信息泄露
 
 ---
@@ -112,11 +112,12 @@ python cli.py
 ```
 
 菜单选项：
-- **1**：从 OpenSearch 流式导出 CSV
-- **2**：从 Elasticsearch 流式导出 CSV
-- **3**：仅从 CSV 导入 Neo4j
-- **4**：自动执行导出 + 导入 Neo4j（保留 CSV）
-- **5**：退出
+- **1**：从 Elasticsearch 流式导出 CSV
+- **2**：仅从 CSV 导入 Neo4j
+- **3**：自动执行导出 + 导入 Neo4j（保留 CSV，固定使用 Elasticsearch 导出）
+- **4**：退出
+
+> CLI 仅暴露 Elasticsearch 导出；如需从 OpenSearch 导出，可作为库调用 `export_graph_direct(engine="opensearch")`。
 
 Windows 用户也可以直接双击运行 `start.bat`，脚本会自动检测虚拟环境并启动 CLI。
 

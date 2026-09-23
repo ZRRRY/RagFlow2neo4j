@@ -24,4 +24,11 @@ output/
 # Secrets / local config
 config.py
 config_local.py
+config.json
 .env
+
+# Tool caches / logs
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.log

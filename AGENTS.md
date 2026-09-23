@@ -111,11 +111,10 @@ python cli.py
 4. 启动 `python cli.py`。
 
 CLI 菜单选项：
-- **1**：从 OpenSearch 流式导出 CSV
-- **2**：从 Elasticsearch 流式导出 CSV
-- **3**：仅从 CSV 导入 Neo4j（支持自定义路径、连接测试、是否清空数据库）
-- **4**：自动执行导出 + 导入 Neo4j（保留 CSV，导出时可选择 OpenSearch 或 Elasticsearch）
-- **5**：退出
+- **1**：从 Elasticsearch 流式导出 CSV
+- **2**：仅从 CSV 导入 Neo4j（支持自定义路径、连接测试、是否清空数据库）
+- **3**：自动执行导出 + 导入 Neo4j（保留 CSV，固定使用 Elasticsearch 导出）
+- **4**：退出
 
 模块也支持作为库直接导入使用：
 
@@ -145,13 +144,20 @@ with Neo4jWriter() as writer:
 - `_escape_csv_injection(value)` —— 对以 `=`、`+`、`-`、`@`、制表符、回车或换行开头的字符串前缀单引号，防止 Excel/LibreOffice 公式注入。
 - `_safe_serialize(value)` —— 将非标量值序列化为 JSON 字符串，处理 `None` / `NaN` / `Infinity`，供流式导出使用。
 - `_get_session()` —— 创建带重试机制的 `requests.Session`，对 500/502/503/504 的 GET 请求最多重试 3 次，退避因子为 1。
+- `_get_scroll_session()` —— 在 `_get_session()` 基础上显式设置 `Accept-Encoding: gzip`，用于 scroll/计数等长连接；每个工作线程持有自己的 Session（requests.Session 非线程安全）以实现 keep-alive 复用。
 - `_get_tenant_id()` —— 通过 RAGFlow Dataset API 获取 `tenant_id`，供搜索引擎索引名构造使用。
 - `_read_opensearch_config()` —— 统一从 `config` 读取 OpenSearch 直连配置。
 - `_read_elasticsearch_config()` —— 统一从 `config` 读取 Elasticsearch 直连配置。
-- `_count_es_docs(count_url, query, auth)` —— 使用 OpenSearch/Elasticsearch 兼容的 `_count` API 获取文档总数。
-- `_scroll_search_batches(search_url, query, auth, scheme, host, port, batch_size)` —— 生成器：使用 OpenSearch/Elasticsearch 兼容的 scroll API 逐批次 yield hits 列表，自动处理分页并清理 scroll 上下文。
-- `export_graph_direct(kb_id, output_dir, output_prefix, batch_size, engine="opensearch")` —— 流式导出：先 `_count` 统计实体/关系总数，再分两个阶段 scroll 拉取并追加写入 CSV。`engine` 决定使用 OpenSearch 还是 Elasticsearch。
-- `export_graph_direct_elasticsearch(...)` —— `export_graph_direct(engine="elasticsearch")` 的便捷函数。
+- `_count_es_docs(count_url, query, auth, session=None)` —— 使用 OpenSearch/Elasticsearch 兼容的 `_count` API 获取文档总数，可复用传入的 session。
+- `_scroll_search_batches(search_url, query, auth, scheme, host, port, batch_size=5000, session=None, slice_id=0, slice_max=1, scroll_timeout=300)` —— 生成器：使用 scroll API 逐批次 yield hits 列表，初始请求带 `"_source": ["content_with_weight"]`（避免传输向量字段）与 `"sort": ["_doc"]`；`slice_max > 1` 时注入 `"slice": {"id", "max"}` 实现 sliced scroll；初始请求对连接/超时错误最多重试 2 次（间隔 2 秒，幂等安全），翻页请求绝不重试（旧 scroll_id 重试会静默丢批）；自动分页并清理自己的 scroll 上下文。
+- `_prefetch_batches(batch_iter, max_queue=2)` —— 预取流水线：daemon 生产者线程 + `queue.Queue` 后台预取后续批次；生产者异常经队列传递并在消费端重新抛出；消费端提前退出时通过 `threading.Event` 通知生产者停止并关闭底层生成器（触发 scroll 清理）。
+- `_get_slice_count(base_url, index_name, auth, session, max_workers)` —— 通过 `_search_shards` 取索引分片数，返回 `max(1, min(分片数, max_workers))`；失败时回退 1。
+- `_hit_to_node_row(hit)` / `_hit_to_edge_row(hit)` —— 将单个 hit 转换为节点/边 CSV 行（`json.loads` 解析 `content_with_weight`，缺 `entity_name`/`src_id`/`tgt_id` 时返回 None，逐字段做 `_escape_csv_injection` + `_safe_serialize`）。
+- `_export_phase(...)` —— 执行一个导出阶段（节点或边）：启动 num_slices 个 slice 线程（各自持有 session、经 `_prefetch_batches` 预取），用标准库 `csv.writer` 写各自的临时文件 `{final_path}.slice{i}.tmp`（纯 utf-8、无表头）；全部成功后合并为 utf-8-sig 正式文件（BOM 与表头仅一次，临时文件以二进制方式追加后删除）；任一线程失败则清理临时文件并返回失败。多 slice 时用带锁的共享计数器打印「累计/总数」进度。
+- `export_graph_direct(kb_id, output_dir, output_prefix, batch_size=5000, engine="opensearch", slice_workers=4, parallel_phases=True, scroll_timeout=300, phases=("nodes", "edges"))` —— 流式导出：先 `_count` 统计选中阶段的实体/关系总数，再分阶段执行 sliced scroll 并行导出（数量为 0 的阶段跳过；`parallel_phases=True` 时两个阶段并行）。`engine` 决定使用 OpenSearch 还是 Elasticsearch。`scroll_timeout` 为 scroll 单次请求读超时秒数；遇到 scroll 读超时（资源受限的内置 ES 常见）可增大 `scroll_timeout` 或调小 `batch_size`/`slice_workers` 降压。`phases` 指定导出的阶段（`"nodes"`/`"edges"` 的任意非空子集），未选中阶段完全跳过且不删除其已有 CSV；导出前仅删除选中阶段对应的旧 CSV。注意：多 slice 并行后 CSV 行顺序不再保证有序。
+- `export_graph_direct_elasticsearch(...)` —— `export_graph_direct(engine="elasticsearch")` 的便捷函数，透传 `batch_size`/`slice_workers`/`parallel_phases`/`scroll_timeout`/`phases`。
+
+**写盘说明**：`exporter.py` 写 CSV 全部使用标准库 `csv` 模块（不再依赖 pandas；pandas 仍被 `neo4j_importer` 与测试使用）。
 
 ### `neo4j_importer.py`
 - `_sanitize_rel_type(name)` —— 校验关系类型名称是否符合 Cypher 标识符规则（`^[A-Za-z_][A-Za-z0-9_]*$`），不合法时回退为 `RELATED_TO`。
@@ -160,16 +166,16 @@ with Neo4jWriter() as writer:
   - 支持上下文管理器（`with Neo4jWriter() as writer:`）。
   - `test_connection()` —— 测试连接可用性。
   - `clear_database()` —— 执行 `MATCH (n) DETACH DELETE n` 清空数据库（不可逆）。
-  - `import_nodes(csv_path)` —— 从节点 CSV 批量 `MERGE` 到 `:Entity` 标签节点，按 `id` 去重，每批 1000 条。
+  - `import_nodes(csv_path)` —— 从节点 CSV 批量 `MERGE` 到 `:Entity` 标签节点，以 `(id, entity_type)` 复合键去重（同名不同类型的实体会拆分为不同节点），每批 1000 条。
   - `import_edges(csv_path)` —— 从边 CSV 按 `relation` 列分组，批量 `MERGE` 关系，每批 1000 条。
 
 ### `cli.py`
 - `menu()` / `main()` —— 交互式命令循环，捕获 `KeyboardInterrupt` 和未预期异常。
-- `action_export_direct(engine)` —— 根据 engine 调用 `export_graph_direct()` 进行流式导出 CSV。
+- `action_export_direct()` —— 固定从 Elasticsearch 流式导出 CSV（CLI 不再暴露 OpenSearch 导出；exporter 库层面的 `engine="opensearch"` 支持保留）。
 - `action_import_only()` —— 从自定义 CSV 路径导入 Neo4j。
-- `action_auto()` —— 自动执行导出 + 导入，支持选择 OpenSearch 或 Elasticsearch 导出方式。
+- `action_auto()` —— 自动执行导出 + 导入，固定使用 Elasticsearch 导出，不再询问引擎。
 - `_default_csv_paths()` —— 根据 `config.OUTPUT_DIR` 和 `config.OUTPUT_PREFIX` 生成默认 CSV 文件路径。
-- `_run_export_import(engine)` —— 流式导出 + 导入的统一执行逻辑。
+- `_run_export_import()` —— Elasticsearch 流式导出 + 导入的统一执行逻辑。
 
 ---
 
@@ -201,9 +207,11 @@ pytest tests/
 - `tests/test_exporter.py`
   - `TestSafeSerialize`：验证 `None`、`NaN`、`Infinity`、标量类型、列表/字典 JSON 序列化。
   - `TestEscapeCsvInjection`：验证 CSV 公式注入前缀转义。
-  - `TestCountEsDocs`：覆盖 `_count` 成功与异常场景。
-  - `TestScrollSearchBatches`：覆盖 scroll 分页拉取与上下文清理逻辑。
-  - `TestExportGraphDirect`：覆盖 OpenSearch 与 Elasticsearch 流式导出成功、计数失败、空结果、tenant_id 获取失败、非法 engine、便捷函数调用等场景。
+  - `TestCountEsDocs`：覆盖 `_count` 成功与异常场景（基于 mock session）。
+  - `TestScrollSearchBatches`：覆盖 scroll 分页拉取与上下文清理逻辑、初始请求的 `_source` 过滤与 `sort: ["_doc"]`、`slice` 参数注入（仅 `slice_max > 1`）、初始请求重试成功/重试耗尽抛错、翻页请求不重试（避免旧 scroll_id 重试静默丢批）。
+  - `TestPrefetchBatches`：覆盖 `_prefetch_batches` 的顺序保持、异常传播与消费端提前退出时的生成器清理。
+  - `TestGetSliceCount`：覆盖分片数与 `max_workers` 取小、请求失败回退 1。
+  - `TestExportGraphDirect`：覆盖 OpenSearch 与 Elasticsearch 流式导出成功、多 slice 合并后 BOM/表头仅一次（写真实临时文件断言字节内容）、计数失败、空结果、tenant_id 获取失败、零计数阶段跳过、阶段失败、非法 engine、便捷函数调用等场景。
 - `tests/test_neo4j_importer.py`
   - `TestSanitizeRelType`：验证合法/非法关系类型名称的回退行为。
   - `TestNeo4jWriter`：使用 `mock.patch("neo4j_importer.GraphDatabase.driver")` 覆盖初始化、连接测试成功/失败、清空数据库、节点导入 Cypher 断言、边按关系类型分组导入。

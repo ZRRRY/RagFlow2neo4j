@@ -57,7 +57,11 @@ class Neo4jWriter:
         logger.info("已清空 Neo4j 数据库")
 
     def import_nodes(self, csv_path):
-        """从节点 CSV 批量导入到 Neo4j。"""
+        """从节点 CSV 批量导入到 Neo4j。
+
+        节点唯一键为 (id, entity_type) 复合键：同名但类型不同的实体
+        会创建为不同节点，避免只按名称 MERGE 导致的节点融合。
+        """
         path = Path(csv_path)
         if not path.exists():
             logger.error("节点 CSV 不存在: %s", csv_path)
@@ -70,6 +74,9 @@ class Neo4jWriter:
         if "id" not in df.columns:
             logger.error("节点 CSV 缺少 id 列")
             return
+        if "entity_type" not in df.columns:
+            logger.warning("节点 CSV 缺少 entity_type 列，将按空类型处理")
+            df["entity_type"] = ""
 
         records = df.to_dict('records')
         total = len(records)
@@ -81,10 +88,11 @@ class Neo4jWriter:
                 rows = []
                 for r in batch:
                     node_id = r.pop("id", "")
-                    rows.append({"id": node_id, "props": r})
+                    node_type = r.pop("entity_type", "")
+                    rows.append({"id": node_id, "entity_type": node_type, "props": r})
                 session.run("""
                     UNWIND $rows AS row
-                    MERGE (n:Entity {id: row.id})
+                    MERGE (n:Entity {id: row.id, entity_type: row.entity_type})
                     SET n += row.props
                 """, rows=rows)
                 logger.info("节点写入进度: %s/%s", min(i + batch_size, total), total)
@@ -92,7 +100,11 @@ class Neo4jWriter:
         logger.info("节点导入完成，共 %s 条", total)
 
     def import_edges(self, csv_path):
-        """从边 CSV 批量导入到 Neo4j，支持按关系类型分组。"""
+        """从边 CSV 批量导入到 Neo4j，支持按关系类型分组。
+
+        边 CSV 不携带端点的 entity_type，因此端点仍按名称（id）匹配；
+        若同一名称存在多个不同类型的节点，边会连接到所有同名节点。
+        """
         path = Path(csv_path)
         if not path.exists():
             logger.error("边 CSV 不存在: %s", csv_path)
